@@ -65,8 +65,13 @@ class RecurrentCoupler(Coupler):
         h = jnp.zeros([jnp.shape(graph.non_fictitious_addresses)[0], self.phi.out_size])
 
         dt = 1 / self.n_steps
-        for _ in range(self.n_steps):
-            h = h + dt * F(0, h, graph)
+
+        def step(carry, _):
+            return carry + dt * F(0, carry, graph), None
+
+        # lax.scan keeps the compiled program size constant in n_steps,
+        # instead of unrolling the message-passing block n_steps times.
+        h, _ = jax.lax.scan(step, h, xs=None, length=self.n_steps)
 
         return h, {}
 

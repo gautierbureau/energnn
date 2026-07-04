@@ -206,31 +206,42 @@ class HyperEdgeSet(dict):
             parts.append(self.port_array)
         return xp.concatenate(parts, axis=-1)
 
+    def _data_ndim(self) -> int:
+        """Number of dimensions of ``array`` (2 for single, 3 for batch), computed without concatenating."""
+        if self.feature_array is not None:
+            return len(self.feature_array.shape)
+        if self.port_dict is not None and self.port_dict:
+            return len(next(iter(self.port_dict.values())).shape) + 1
+        return len(self.non_fictitious.shape) + 1
+
     @property
     def is_batch(self) -> bool:
         """True if ``array`` is 3-D: ``(batch, n_obj, features+ports)``."""
-        return len(self.array.shape) == 3
+        return self._data_ndim() == 3
 
     @property
     def is_single(self) -> bool:
         """True if ``array`` is 2-D: ``(n_obj, features+ports)``."""
-        return len(self.array.shape) == 2
+        return self._data_ndim() == 2
 
     @property
     def n_obj(self) -> int:
         """Number of hyper-edges per instance."""
-        if self.is_single:
-            return int(self.array.shape[0])
-        elif self.is_batch:
-            return int(self.array.shape[1])
-        else:
-            raise ValueError("HyperEdgeSet is neither single nor batched.")
+        if self.feature_array is not None:
+            return int(self.feature_array.shape[-2])
+        if self.port_dict is not None and self.port_dict:
+            return int(next(iter(self.port_dict.values())).shape[-1])
+        return int(self.non_fictitious.shape[-1])
 
     @property
     def n_batch(self) -> int:
         """Number of batches; valid only when ``is_batch`` is True."""
         if self.is_batch:
-            return int(self.array.shape[0])
+            if self.feature_array is not None:
+                return int(self.feature_array.shape[0])
+            if self.port_dict is not None and self.port_dict:
+                return int(next(iter(self.port_dict.values())).shape[0])
+            return int(self.non_fictitious.shape[0])
         raise ValueError("HyperEdgeSet is not batched.")
 
     # ------------------------------------------------------------------
@@ -287,12 +298,11 @@ class HyperEdgeSet(dict):
         if not self.feature_names:
             return None
         xp = self._backend.xp
+        is_batch = self.is_batch
         result = {}
         for k, v in self.feature_names.items():
-            if self.is_batch:
-                result[k] = self.feature_array[..., xp.array(v[0], int)]
-            else:
-                result[k] = self.feature_array[..., xp.array(v, int)]
+            idx = v[0] if is_batch else v
+            result[k] = self.feature_array[..., xp.array(idx, int)]
         return result
 
     @property
@@ -592,11 +602,11 @@ def _compute_n_objects(port_dict: dict | None, feature_dict: dict | None) -> int
 
 
 def _check_keys_consistency(hes_1: HyperEdgeSet, hes_2: HyperEdgeSet) -> None:
-    if (hes_1.port_names is None) != (hes_2.port_names is None):
+    if (hes_1.port_dict is None) != (hes_2.port_dict is None):
         raise ValueError("Mismatch in presence of port_names among hyper-edge sets.")
     if (hes_1.feature_names is None) != (hes_2.feature_names is None):
         raise ValueError("Mismatch in presence of feature_names among hyper-edge sets.")
-    if hes_1.port_names and hes_1.port_names.keys() != hes_2.port_names.keys():
+    if hes_1.port_dict and hes_1.port_dict.keys() != hes_2.port_dict.keys():
         raise ValueError("Inconsistent port_names keys among hyper-edge sets.")
     if hes_1.feature_names and hes_1.feature_names.keys() != hes_2.feature_names.keys():
         raise ValueError("Inconsistent feature_names keys among hyper-edge sets.")

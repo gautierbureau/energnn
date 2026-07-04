@@ -4,18 +4,28 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 # SPDX-License-Identifier: MPL-2.0
 
-import copy
-from copy import deepcopy
-
+import jax
 import jax.numpy as jnp
 import numpy as np
 from omegaconf import DictConfig
 
 from energnn.graph import GraphStructure, HyperEdgeSetStructure
-from energnn.graph import Graph, GraphShape, HyperEdgeSet, JaxBackend, collate_graphs
+from energnn.graph import Graph, GraphShape, HyperEdgeSet, collate_graphs
 from ..batch import ProblemBatch
 from ..loader import ProblemLoader
 from ..problem import Problem
+
+
+def _tree_copy(graph: Graph) -> Graph:
+    """
+    Structural copy of a JAX-backed graph.
+
+    Rebuilds all the containers (so in-place structural mutations of the copy do not
+    affect the original) while sharing the immutable JAX array leaves. This is much
+    cheaper than ``copy.deepcopy``, which would also copy every array buffer.
+    """
+    return jax.tree.map(lambda x: x, graph)
+
 
 LINEAR_SYSTEM_CONTEXT_STRUCTURE = GraphStructure(
     hyper_edge_sets={
@@ -35,8 +45,7 @@ class LinearSystemProblemBatch(ProblemBatch):
         self.context = context
         self.oracle = oracle
 
-        zero_decision = copy.deepcopy(oracle)
-        # Vérifier opération
+        zero_decision = _tree_copy(oracle)
         zero_decision.feature_flat_array = 0.0 * zero_decision.feature_flat_array
         self.zero_decision = zero_decision
 
@@ -50,32 +59,29 @@ class LinearSystemProblemBatch(ProblemBatch):
 
     def get_context(self, get_info: bool = False, step: int | None = None) -> tuple[Graph, dict]:
         """Returns the context :class:`Graph` :math:`x`."""
-        return deepcopy(self.context), {}
+        return _tree_copy(self.context), {}
 
     def get_oracle(self, get_info: bool = False) -> tuple[Graph, dict]:
         r"""Returns the ground truth :class:`Graph` :math:`y^{\star}(x)`."""
-        return deepcopy(self.oracle), {}
+        return _tree_copy(self.oracle), {}
 
     def get_zero_decision(self, get_info: bool = False) -> tuple[Graph, dict]:
         """Returns a decision filled with zeros."""
-        return deepcopy(self.zero_decision), {}
+        return _tree_copy(self.zero_decision), {}
 
     def get_gradient(
         self, decision: Graph, cfg: DictConfig | None = None, get_info: bool = False, step: int | None = None
     ) -> tuple[Graph, dict]:
         r"""Returns the gradient :class:`Graph` :math:`\nabla_y f(y;x) = y - y^{\star}(x)`."""
-        # gradient = decision.to_numpy_graph()
-        gradient = deepcopy(decision)
+        gradient = _tree_copy(decision)
         gradient.feature_flat_array = gradient.feature_flat_array - self.oracle.feature_flat_array
-        # jax_gradient = Graph.from_numpy_graph(gradient)
         return gradient, {}
 
     def get_score(
         self, decision: Graph, cfg: DictConfig | None = None, get_info: bool = False, step: int | None = None
     ) -> tuple[list[float], dict]:
         """Returns the mean-squared error of the decision :class:`Graph` with regard to the oracle :class:`Graph`."""
-        # gradient = decision.to_numpy_graph()
-        gradient = deepcopy(decision)
+        gradient = _tree_copy(decision)
         gradient.feature_flat_array = gradient.feature_flat_array - self.oracle.feature_flat_array
         objective = jnp.nanmean(jnp.square(gradient.feature_flat_array), axis=1)
         return objective.tolist(), {}
@@ -91,7 +97,7 @@ class LinearSystemProblem(Problem):
         self.context = context
         self.oracle = oracle
 
-        zero_decision = copy.deepcopy(oracle)
+        zero_decision = _tree_copy(oracle)
         zero_decision.feature_flat_array = 0.0 * zero_decision.feature_flat_array
         self.zero_decision = zero_decision
 
@@ -105,32 +111,29 @@ class LinearSystemProblem(Problem):
 
     def get_context(self, get_info: bool = False, step: int | None = None) -> tuple[Graph, dict]:
         """Returns the context :class:`Graph` :math:`x`."""
-        return deepcopy(self.context), {}
+        return _tree_copy(self.context), {}
 
     def get_oracle(self, get_info: bool = False) -> tuple[Graph, dict]:
         r"""Returns the ground truth :class:`Graph` :math:`y^{\star}(x)`."""
-        return deepcopy(self.oracle), {}
+        return _tree_copy(self.oracle), {}
 
     def get_zero_decision(self, get_info: bool = False) -> tuple[Graph, dict]:
         """Returns a decision filled with zeros."""
-        return deepcopy(self.zero_decision), {}
+        return _tree_copy(self.zero_decision), {}
 
     def get_gradient(
         self, decision: Graph, cfg: DictConfig | None = None, get_info: bool = False, step: int | None = None
     ) -> tuple[Graph, dict]:
         r"""Returns the gradient :class:`Graph` :math:`\nabla_y f(y;x) = y - y^{\star}(x)`."""
-        # gradient = decision.to_numpy_graph()
-        gradient = deepcopy(decision)
+        gradient = _tree_copy(decision)
         gradient.feature_flat_array = gradient.feature_flat_array - self.oracle.feature_flat_array
-        # jax_gradient = Graph.from_numpy_graph(gradient)
         return gradient, {}
 
     def get_score(
         self, decision: Graph, cfg: DictConfig | None = None, get_info: bool = False, step: int | None = None
     ) -> tuple[float, dict]:
         """Returns the mean-squared error of the decision :class:`Graph` with regard to the oracle :class:`Graph`."""
-        # gradient = decision.to_numpy_graph()
-        gradient = deepcopy(decision)
+        gradient = _tree_copy(decision)
         gradient.feature_flat_array = gradient.feature_flat_array - self.oracle.feature_flat_array
         objective = jnp.nanmean(jnp.square(gradient.feature_flat_array))
         return float(objective), {}
@@ -190,7 +193,13 @@ class LinearSystemProblemGenerator:
 
         np.random.seed(seed)
 
-    def generate_problem(self) -> LinearSystemProblem:
+    def _generate_numpy_problem(self) -> tuple[Graph, Graph]:
+        """Generate a (context, oracle) pair on the NumPy backend.
+
+        Construction, validation, and padding of many small, randomly-sized graphs are
+        much cheaper on NumPy: doing them on the JAX backend triggers one XLA
+        compilation per new array shape.
+        """
         n = np.random.randint(2, self.n_max + 1)
         m = np.random.randint(n - 1, n * (n - 1) // 2 + 1)
         B, P, theta = _generate_sparse_linear_system(n, m)
@@ -198,52 +207,45 @@ class LinearSystemProblemGenerator:
         # Context
         # Use line for off-diagonal terms
         rows, cols = np.nonzero(np.triu(B, k=1))
-        jax_backend = JaxBackend()
-        line = HyperEdgeSet.from_dict(
-            backend=jax_backend, port_dict={"from": rows, "to": cols}, feature_dict={"susceptance": -B[rows, cols]}
-        )
-        bus_context = HyperEdgeSet.from_dict(
-            backend=jax_backend, port_dict={"id": np.arange(n)}, feature_dict={"active_power_injection": P}
-        )
-        context = Graph.from_dict(
-            backend=jax_backend, hyper_edge_set_dict={"line": line, "bus": bus_context}, n_addresses=jnp.array(n)
-        )
+        line = HyperEdgeSet.from_dict(port_dict={"from": rows, "to": cols}, feature_dict={"susceptance": -B[rows, cols]})
+        bus_context = HyperEdgeSet.from_dict(port_dict={"id": np.arange(n)}, feature_dict={"active_power_injection": P})
+        context = Graph.from_dict(hyper_edge_set_dict={"line": line, "bus": bus_context}, n_addresses=n)
 
         # Oracle
         # Use bus for the solution (phase angles)
-        bus_oracle = HyperEdgeSet.from_dict(backend=jax_backend, port_dict=None, feature_dict={"phase_angle": theta})
-        oracle = Graph.from_dict(backend=jax_backend, hyper_edge_set_dict={"bus": bus_oracle}, n_addresses=jnp.array(n))
+        bus_oracle = HyperEdgeSet.from_dict(port_dict=None, feature_dict={"phase_angle": theta})
+        oracle = Graph.from_dict(hyper_edge_set_dict={"bus": bus_oracle}, n_addresses=n)
 
-        return LinearSystemProblem(context=context, oracle=oracle)
+        return context, oracle
+
+    def generate_problem(self) -> LinearSystemProblem:
+        context, oracle = self._generate_numpy_problem()
+        return LinearSystemProblem(context=Graph.to_jax_backend(context), oracle=Graph.to_jax_backend(oracle))
 
     def generate_problem_batch(self, batch_size: int = 8) -> LinearSystemProblemBatch:
 
         context_list, oracle_list = [], []
 
         for _ in range(batch_size):
-            problem = self.generate_problem()
-            context = problem.context
-            oracle = problem.oracle
+            context, oracle = self._generate_numpy_problem()
             context_list.append(context)
             oracle_list.append(oracle)
 
-        jax_backend = JaxBackend()
         max_context_shape = GraphShape(
-            backend=jax_backend,
             hyper_edge_sets={
-                "line": jnp.array(self.n_max * (self.n_max - 1) // 2),
-                "bus": jnp.array(self.n_max),
+                "line": np.array(self.n_max * (self.n_max - 1) // 2),
+                "bus": np.array(self.n_max),
             },
-            addresses=jnp.array(self.n_max),
+            addresses=np.array(self.n_max),
         )
-        max_oracle_shape = GraphShape(
-            backend=jax_backend, hyper_edge_sets={"bus": jnp.array(self.n_max)}, addresses=jnp.array(self.n_max)
-        )
+        max_oracle_shape = GraphShape(hyper_edge_sets={"bus": np.array(self.n_max)}, addresses=np.array(self.n_max))
 
         [context.pad(target_shape=max_context_shape) for context in context_list]
         [oracle.pad(target_shape=max_oracle_shape) for oracle in oracle_list]
-        context_batch = collate_graphs(context_list)
-        oracle_batch = collate_graphs(oracle_list)
+
+        # Pad and collate on NumPy, then transfer the whole batch to device in one go.
+        context_batch = Graph.to_jax_backend(collate_graphs(context_list))
+        oracle_batch = Graph.to_jax_backend(collate_graphs(oracle_list))
 
         return LinearSystemProblemBatch(context=context_batch, oracle=oracle_batch)
 

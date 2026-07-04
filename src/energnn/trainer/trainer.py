@@ -308,13 +308,18 @@ class Trainer:
         :return: Average score obtained over the problem loader.
         """
         score_list, infos_list = [], []
+        # Running nan-aware mean, to avoid re-concatenating all previous scores at every batch.
+        score_sum, score_count = 0.0, 0
         pbar = tqdm(loader, desc="Validation", unit="batch", leave=True, disable=not progress_bar, position=position)
         for step, problem_batch in enumerate(pbar):
             score_batch, info_batch = self.eval_step(step, problem_batch)
             score_list.append(score_batch)
             infos_list.append(info_batch)
             if progress_bar:
-                pbar.set_postfix(score=f"{np.nanmean(np.concatenate(score_list)):.4e}")
+                score_array = np.asarray(score_batch, dtype=float)
+                score_sum += np.nansum(score_array)
+                score_count += int(np.sum(~np.isnan(score_array)))
+                pbar.set_postfix(score=f"{score_sum / max(score_count, 1):.4e}")
 
         mean_score = np.nanmean(np.concatenate(score_list)).astype(float)
 
@@ -339,58 +344,64 @@ class Trainer:
         :param get_info: Whether to compute information or not.
         :return: A dictionary of information about the training step, or list of dictionaries.
         """
+        # Fine-grained stage timing forces a host-device synchronization after every
+        # stage (block_until_ready), which serializes the training loop. Only pay
+        # that cost when INFO logging is actually enabled.
+        log_timings = logger.isEnabledFor(logging.INFO)
+
+        def _sync_and_log(stage: str, t_start: float, value=None) -> None:
+            if log_timings:
+                if value is not None:
+                    jax.block_until_ready(value)
+                logger.info(f"[training_step {self.train_step}] {stage}: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+
         with TaskLogger(logger, f"Training step {self.train_step}"):
 
             t_start = time.perf_counter()
             self.model.train()  # Set model to train mode
-            logger.info(f"[training_step {self.train_step}] model.train(): {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("model.train()", t_start)
 
             infos = {}
             t_start = time.perf_counter()
             jax_context, infos["1_context"] = problem_batch.get_context(get_info=get_info, step=self.train_step)
-            jax.block_until_ready(jax_context)
-            logger.info(f"[training_step {self.train_step}] get_context: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("get_context", t_start, jax_context)
 
             t_start = time.perf_counter()
             graphdef, params, rest = nnx.split(self.model, nnx.Param, ...)
-            logger.info(f"[training_step {self.train_step}] nnx.split: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("nnx.split", t_start)
 
             t_start = time.perf_counter()
             jax_decision, rest_updated, vjp_fn = self._jit_apply(graphdef, params, rest, jax_context, get_info)
-            jax.block_until_ready(jax_decision)
-            logger.info(f"[training_step {self.train_step}] forward: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("forward", t_start, jax_decision)
 
             t_start = time.perf_counter()
             nnx.update(self.model, rest_updated)
-            logger.info(f"[training_step {self.train_step}] nnx.update: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("nnx.update", t_start)
 
             t_start = time.perf_counter()
             jax_gradient, infos["3_gradient"] = problem_batch.get_gradient(
                 decision=jax_decision, get_info=get_info, step=self.train_step
             )
-            jax.block_until_ready(jax_gradient)
-            logger.info(f"[training_step {self.train_step}] get_gradient: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("get_gradient", t_start, jax_gradient)
 
             t_start = time.perf_counter()
             jax_cotangent = _cast_cotangent_to_primal_dtype(jax_gradient, jax_decision)
-            jax.block_until_ready(jax_cotangent)
-            logger.info(f"[training_step {self.train_step}] cast_cotangent: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("cast_cotangent", t_start, jax_cotangent)
 
             # Backward pass
             t_start = time.perf_counter()
             rest_cotangent = jax.tree.map(jnp.zeros_like, rest_updated)
-            jax.block_until_ready(rest_cotangent)
-            logger.info(f"[training_step {self.train_step}] rest_cotangent: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("rest_cotangent", t_start, rest_cotangent)
 
             t_start = time.perf_counter()
             (grads_params, _) = vjp_fn((jax_cotangent, rest_cotangent))
-            jax.block_until_ready(grads_params)
-            logger.info(f"[training_step {self.train_step}] vjp_fn: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            _sync_and_log("vjp_fn", t_start, grads_params)
 
             t_start = time.perf_counter()
             self._jit_update_params(self.optimizer, self.model, grads_params)
-            jax.block_until_ready(nnx.state(self.model))
-            logger.info(f"[training_step {self.train_step}] update_params: {(time.perf_counter() - t_start) * 1000:.3f} ms")
+            if log_timings:
+                jax.block_until_ready(nnx.state(self.model))
+            _sync_and_log("update_params", t_start)
 
             infos["4_update"] = {}
 
