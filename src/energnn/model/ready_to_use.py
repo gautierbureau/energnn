@@ -4,6 +4,7 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 # SPDX-License-Identifier: MPL-2.0
 
+import jax.numpy as jnp
 from flax import nnx
 
 from energnn.graph import GraphStructure
@@ -29,9 +30,14 @@ class ReadyRecurrentEquivariantGNN(GNN):
         normalizer_update_period: int = 1,
         normalizer_external_updates: bool = False,
         remat: bool = False,
+        compute_dtype: str | None = None,
     ):
 
         rngs = nnx.Rngs(seed)
+        # Computation dtype for all MLPs (e.g. "bfloat16" for mixed precision on GPU/TPU).
+        # Parameters, the message-passing recurrence carry, scatter accumulations, and the
+        # normalizer stay in float32; only the matmuls run in the reduced precision.
+        dtype = jnp.dtype(compute_dtype) if compute_dtype is not None else None
 
         normalizer = TDigestNormalizer(
             in_structure=in_structure,
@@ -48,6 +54,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             out_size=latent_dimension,
             use_bias=True,
             final_activation=None,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -61,6 +68,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             final_activation=None,
             outer_activation=nnx.tanh,
             encoded_feature_size=latent_dimension,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -71,6 +79,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             out_size=latent_dimension,
             use_bias=True,
             final_activation=nnx.tanh,
+            dtype=dtype,
             rngs=rngs,
         )
 
@@ -90,6 +99,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             use_bias=True,
             final_activation=None,
             encoded_feature_size=latent_dimension,
+            dtype=dtype,
             rngs=rngs,
         )
 

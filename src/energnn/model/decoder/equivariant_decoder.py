@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import initializers
-from flax.typing import Initializer
+from flax.typing import Dtype, Initializer
 
 from energnn.graph import Graph, GraphShape, GraphStructure, HyperEdgeSet
 from energnn.model.utils import Activation, MLP, gather
@@ -47,6 +47,8 @@ class MLPEquivariantDecoder(EquivariantDecoder):
     :param bias_init: Bias initializer for the MLPs :math:`\phi_\theta^c`.
     :param final_activation: Activation of the final layer of the MLPs :math:`\phi_\theta^c`.
     :param encoded_feature_size: None if the input data has not been encoded, otherwise the size of the encoded features.
+    :param dtype: Computation dtype of the MLPs :math:`\phi_\theta^c` (e.g. ``jnp.bfloat16``
+        for mixed precision); parameters stay float32. None (default) computes in full precision.
     :param seed: Seed for RNG streams for weight initialization.
     """
 
@@ -63,6 +65,7 @@ class MLPEquivariantDecoder(EquivariantDecoder):
         bias_init: Initializer = initializers.zeros_init(),
         final_activation: Activation | None = None,
         encoded_feature_size: int | None = None,
+        dtype: Dtype | None = None,
         seed: int | None = None,
         rngs: nnx.Rngs | None = None,
     ):
@@ -85,6 +88,7 @@ class MLPEquivariantDecoder(EquivariantDecoder):
         self.bias_init = bias_init
         self.final_activation = final_activation
         self.encoded_feature_size = encoded_feature_size
+        self.dtype = dtype
 
         self.mlp_dict = self._build_mlp_dict(seed=seed, rngs=rngs)
         self.feature_names_dict = nnx.data(
@@ -126,6 +130,7 @@ class MLPEquivariantDecoder(EquivariantDecoder):
                 kernel_init=self.kernel_init,
                 bias_init=self.bias_init,
                 final_activation=self.final_activation,
+                dtype=self.dtype,
                 rngs=rngs,
             )
         return nnx.data(mlp_dict)
