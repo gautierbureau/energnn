@@ -160,22 +160,32 @@ class GraphShape(dict):
         xp = self._backend.xp
         return xp.stack(list(self.hyper_edge_sets.values()), axis=-1)
 
+    def _probe_ndim(self) -> int:
+        """Number of dimensions of a per-class count entry, computed without stacking."""
+        xp = self._backend.xp
+        if self.hyper_edge_sets:
+            return len(xp.shape(next(iter(self.hyper_edge_sets.values()))))
+        return len(xp.shape(self.addresses))
+
     @property
     def is_single(self) -> bool:
         """True if the array is 1-D."""
-        return len(self.array.shape) == 1
+        return self._probe_ndim() == 0
 
     @property
     def is_batch(self) -> bool:
         """True if the array is 2-D."""
-        return len(self.array.shape) == 2
+        return self._probe_ndim() == 1
 
     @property
     def n_batch(self) -> int:
         """Return the batch size; raises if not batched."""
         if not self.is_batch:
             raise ValueError("GraphShape is not batched.")
-        return self.array.shape[0]
+        xp = self._backend.xp
+        if self.hyper_edge_sets:
+            return xp.shape(next(iter(self.hyper_edge_sets.values())))[0]
+        return xp.shape(self.addresses)[0]
 
 
 # ---------------------------------------------------------------------------
