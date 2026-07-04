@@ -27,6 +27,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
         n_steps: int = 5,
         seed: int = 0,
         normalizer_update_period: int = 1,
+        normalizer_external_updates: bool = False,
         remat: bool = False,
     ):
 
@@ -37,6 +38,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             n_breakpoints=n_breakpoints,
             update_limit=1000,
             update_period=normalizer_update_period,
+            external_updates=normalizer_external_updates,
         )
 
         encoder = MLPEncoder(

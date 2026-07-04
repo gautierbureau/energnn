@@ -265,6 +265,7 @@ class TDigestModule(nnx.Module):
         max_centroids: int,
         use_running_average: bool,
         update_period: int = 1,
+        external_updates: bool = False,
     ):
         """
         Initializes the TDigestModule.
@@ -277,6 +278,11 @@ class TDigestModule(nnx.Module):
         :param update_period: Ingest new data only every ``update_period`` training calls.
             Each ingestion is a host round-trip (io_callback) that synchronizes the device,
             so values > 1 amortize that cost. The first call always ingests.
+        :param external_updates: If True, ``__call__`` never updates the T-Digest state and
+            stays free of host callbacks — the compiled forward has no host round-trip and
+            can be persisted by the JAX compilation cache. Statistics are then only updated
+            through explicit :meth:`ingest` calls (the trainer performs one per training
+            step, on the host, before the forward pass).
         """
         if update_period < 1:
             raise ValueError(f"update_period must be >= 1, got {update_period}")
@@ -287,6 +293,7 @@ class TDigestModule(nnx.Module):
         self.max_centroids = max_centroids
         self.use_running_average = use_running_average
         self.update_period = update_period
+        self.external_updates = external_updates
 
         self.updates = nnx.Variable(jnp.array([0], dtype=jnp.int32))
         self.calls = nnx.Variable(jnp.array([0], dtype=jnp.int32))
@@ -310,11 +317,13 @@ class TDigestModule(nnx.Module):
         :return: Normalized array of the same shape as input.
         """
         is_training = not self.use_running_average
-        should_update = (
-            is_training & (self.updates[...] < self.update_limit)[0] & (self.calls[...] % self.update_period == 0)[0]
-        )
 
-        if is_training:
+        # With external updates, the state is only modified through explicit ingest()
+        # calls, so the traced computation stays free of host callbacks.
+        if is_training and not self.external_updates:
+            should_update = (
+                is_training & (self.updates[...] < self.update_limit)[0] & (self.calls[...] % self.update_period == 0)[0]
+            )
             module_state = (
                 self.max_centroids_var[...],
                 self.min_var[...],
@@ -372,6 +381,44 @@ class TDigestModule(nnx.Module):
         out = out * non_fictitious
         return out
 
+    def ingest(self, array, non_fictitious) -> None:
+        """
+        Host-side T-Digest ingestion, equivalent to the in-forward update path.
+
+        Respects ``use_running_average``, ``update_limit``, and ``update_period`` using
+        the same counters as the in-forward path. Must be called outside of jit.
+
+        :param array: Input array of shape (..., in_size).
+        :param non_fictitious: Mask for valid (non-fictitious) items, shape (..., 1).
+        """
+        if self.use_running_average:
+            return
+        calls = int(self.calls[0])
+        updates = int(self.updates[0])
+        self.calls[...] = self.calls[...] + 1
+        if updates >= self.update_limit or calls % self.update_period != 0:
+            return
+
+        new_vars = _ingest_new_data(
+            np.asarray(self.max_centroids_var[...]),
+            np.asarray(self.min_var[...]),
+            np.asarray(self.max_var[...]),
+            np.asarray(self.centroids_m_var[...]),
+            np.asarray(self.centroids_c_var[...]),
+            np.asarray(self.fp_var[...]),
+            np.asarray(self.xp_var[...]),
+            np.asarray(array, dtype=np.float32),
+            np.asarray(non_fictitious, dtype=np.float32),
+        )
+        self.max_centroids_var[...] = jnp.asarray(new_vars[0])
+        self.min_var[...] = jnp.asarray(new_vars[1])
+        self.max_var[...] = jnp.asarray(new_vars[2])
+        self.centroids_m_var[...] = jnp.asarray(new_vars[3])
+        self.centroids_c_var[...] = jnp.asarray(new_vars[4])
+        self.fp_var[...] = jnp.asarray(new_vars[5])
+        self.xp_var[...] = jnp.asarray(new_vars[6])
+        self.updates[...] = self.updates[...] + 1
+
 
 class TDigestNormalizer(Normalizer):
     """
@@ -389,6 +436,7 @@ class TDigestNormalizer(Normalizer):
         max_centroids: int = 1000,
         use_running_average: bool = False,
         update_period: int = 1,
+        external_updates: bool = False,
     ):
         """
         Initializes the TDigestNormalizer.
@@ -401,6 +449,13 @@ class TDigestNormalizer(Normalizer):
         :param update_period: Ingest new data only every ``update_period`` training calls.
             Each ingestion is a host round-trip that synchronizes the device, so values > 1
             amortize that cost while still tracking the feature distributions.
+        :param external_updates: If True, the forward pass never updates the T-Digest
+            statistics and stays free of host callbacks (no device synchronization inside
+            the compiled program, and the training forward can be persisted by the JAX
+            compilation cache). Statistics are then only updated through :meth:`ingest`,
+            which the :class:`~energnn.trainer.Trainer` calls once per training step.
+            Custom training loops that call the model directly must call ``ingest``
+            themselves, otherwise the statistics stay at their initial values.
         """
         self.in_structure = in_structure
         self.update_limit = update_limit
@@ -408,6 +463,7 @@ class TDigestNormalizer(Normalizer):
         self.max_centroids = max_centroids
         self.use_running_average = use_running_average
         self.update_period = update_period
+        self.external_updates = external_updates
 
         self.module_dict = self._build_module_dict()
 
@@ -424,10 +480,30 @@ class TDigestNormalizer(Normalizer):
                     max_centroids=self.max_centroids,
                     use_running_average=self.use_running_average,
                     update_period=self.update_period,
+                    external_updates=self.external_updates,
                 )
             else:
                 module_dict[key] = None
         return nnx.data(module_dict)
+
+    def ingest(self, *, graph: Graph) -> None:
+        """
+        Update the T-Digest statistics from a graph, outside of the jitted forward pass.
+
+        Only has an effect when the normalizer was constructed with ``external_updates=True``;
+        otherwise the statistics are updated inside the forward pass and this is a no-op.
+        Must be called outside of jit.
+
+        :param graph: Graph whose hyper-edge set features should be ingested.
+        """
+        if not self.external_updates:
+            return
+        for key, hyper_edge_set in graph.hyper_edge_sets.items():
+            module = self.module_dict.get(key)
+            if module is None or hyper_edge_set.feature_array is None:
+                continue
+            if hyper_edge_set.feature_array.shape[-2] > 0:
+                module.ingest(hyper_edge_set.feature_array, jnp.expand_dims(hyper_edge_set.non_fictitious, -1))
 
     def set_running_average(self, use: bool):
         """

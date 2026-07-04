@@ -403,6 +403,14 @@ class Trainer:
             jax_context, infos["1_context"] = problem_batch.get_context(get_info=get_info, step=self.train_step)
             _sync_and_log("get_context", t_start, jax_context)
 
+            # Host-side normalizer statistics update (no-op unless the model's normalizer
+            # is configured for external updates).
+            t_start = time.perf_counter()
+            ingest = getattr(self.model, "ingest", None)
+            if ingest is not None:
+                ingest(graph=jax_context)
+            _sync_and_log("ingest", t_start)
+
             t_start = time.perf_counter()
             graphdef, params, rest = nnx.split(self.model, nnx.Param, ...)
             _sync_and_log("nnx.split", t_start)

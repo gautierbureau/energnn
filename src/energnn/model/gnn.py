@@ -56,6 +56,19 @@ class GNN(nnx.Module):
         output, info["decoding"] = self.decoder(coordinates=latent_coordinates, graph=encoded_graph, get_info=get_info)
         return output, info
 
+    def ingest(self, *, graph: Graph) -> None:
+        """Update the normalizer's statistics from a context graph, outside the jitted forward.
+
+        No-op unless the normalizer is configured for external updates
+        (see :meth:`energnn.model.normalizer.Normalizer.ingest`). The trainer calls this
+        once per training step on the context batch, before the forward pass.
+
+        :param graph: Context graph whose features should be ingested.
+        """
+        ingest = getattr(self.normalizer, "ingest", None)
+        if ingest is not None:
+            ingest(graph=graph)
+
     def forward_batch(self, *, graph: Graph, get_info: bool = False) -> tuple[Graph | jax.Array, dict]:
         """Applies the model to a batch of graphs.
 
