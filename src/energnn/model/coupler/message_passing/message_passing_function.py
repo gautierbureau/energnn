@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import initializers
-from flax.typing import Initializer
+from flax.typing import Dtype, Initializer
 
 from energnn.graph import GraphStructure, Graph
 from energnn.model.utils import Activation, MLP, gather, scatter_add
@@ -54,6 +54,9 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
     :param outer_activation: Activation function :math:`\sigma` applied over the output.
     :param encoded_feature_size: None if the input data has not been encoded, otherwise the size of the encoded features.
     :param port_scatter_blacklist: Dictionary mapping hyper-edge set keys to lists of port keys to be excluded from the sum.
+    :param dtype: Computation dtype of the MLPs :math:`\xi^{c,o}_\theta` (e.g. ``jnp.bfloat16``
+        for mixed precision); parameters stay float32 and the scatter accumulation runs in
+        float32. None (default) computes in full precision.
     :param seed: Seed for RNG streams for weight initialization.
     """
 
@@ -71,6 +74,7 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
         outer_activation: Activation = nnx.tanh,
         encoded_feature_size: int | None = None,
         port_scatter_blacklist: dict[str, list[str]] | None = None,
+        dtype: Dtype | None = None,
         seed: int | None = None,
         rngs: nnx.Rngs | None = None,
     ):
@@ -85,6 +89,7 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
         self.final_activation = final_activation
         self.outer_activation = outer_activation
         self.encoded_feature_size = encoded_feature_size
+        self.dtype = dtype
         if port_scatter_blacklist is None:
             self.port_scatter_blacklist = {}
         else:
@@ -123,6 +128,7 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
                             kernel_init=self.kernel_init,
                             bias_init=self.bias_init,
                             final_activation=self.final_activation,
+                            dtype=self.dtype,
                             rngs=rngs,
                         )
         return nnx.data(mlp_tree)
