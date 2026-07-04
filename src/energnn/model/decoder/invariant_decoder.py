@@ -11,9 +11,22 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
-from energnn.graph import Graph
-from energnn.model.utils import MLP
+from energnn.graph import ADDRESS_GRAPH_IDS, Graph
+from energnn.model.utils import MLP, scatter_add
 from .decoder import Decoder
+
+
+def _sum_over_addresses(graph: Graph, h: jax.Array) -> jax.Array:
+    """Sum per-address values into a global vector, or per-instance vectors for a union graph.
+
+    For a regular graph, returns ``sum(h, axis=0)`` of shape ``(d,)``. For a disjoint-union
+    graph (with segment metadata), returns per-instance sums of shape ``(n_graphs, d)``;
+    fictitious addresses carry an out-of-range id and are dropped by the scatter.
+    """
+    if graph.segments is not None:
+        accumulator = jnp.zeros((graph.n_union_graphs, h.shape[-1]))
+        return scatter_add(accumulator=accumulator, increment=h, addresses=graph.segments[ADDRESS_GRAPH_IDS])
+    return jnp.sum(h, axis=0)
 
 
 class InvariantDecoder(Decoder, ABC):
@@ -57,7 +70,7 @@ class SumInvariantDecoder(InvariantDecoder):
     def __call__(self, *, graph: Graph, coordinates: jax.Array, get_info: bool = False) -> tuple[jax.Array, dict]:
         h = self.psi(coordinates)
         h = h * jnp.expand_dims(graph.non_fictitious_addresses, -1)
-        h = jnp.sum(h, axis=0)
+        h = _sum_over_addresses(graph, h)
         out = self.phi(h)
         return out, {}
 
@@ -83,6 +96,6 @@ class MeanInvariantDecoder(InvariantDecoder):
     def __call__(self, *, graph: Graph, coordinates: jax.Array, get_info: bool = False) -> tuple[jax.Array, dict]:
         numerator = self.psi(coordinates)
         numerator = numerator * jnp.expand_dims(graph.non_fictitious_addresses, -1)
-        numerator = jnp.sum(numerator, axis=0)
-        denominator = jnp.sum(graph.non_fictitious_addresses, axis=0) + 1e-9
+        numerator = _sum_over_addresses(graph, numerator)
+        denominator = _sum_over_addresses(graph, jnp.expand_dims(graph.non_fictitious_addresses, -1)) + 1e-9
         return self.phi(numerator / denominator), {}

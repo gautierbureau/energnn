@@ -122,6 +122,8 @@ The following functions help to manipulate graphs, hyper-edge sets, shapes objec
     concatenate_graphs
     get_statistics
     separate_graphs
+    separate_union
+    union_graphs
     check_hyper_edge_set_dict_type
     collate_hyper_edge_sets
     concatenate_hyper_edge_sets

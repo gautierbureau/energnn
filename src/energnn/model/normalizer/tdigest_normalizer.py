@@ -558,6 +558,7 @@ class TDigestNormalizer(Normalizer):
             non_fictitious_addresses=graph.non_fictitious_addresses,
             true_shape=graph.true_shape,
             current_shape=graph.current_shape,
+            segments=graph.segments,
         )
 
         if get_info:

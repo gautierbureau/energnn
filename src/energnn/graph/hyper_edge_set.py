@@ -380,6 +380,8 @@ class HyperEdgeSet(dict):
 
     def offset_addresses(self, offset) -> None:
         """Add ``offset`` to every port address; used before graph concatenation."""
+        if self.port_dict is None:
+            return
         xp = self._backend.xp
         # Cast the offset to each port array's dtype so integer addresses are not upcast.
         self.port_dict = {k: a + xp.asarray(offset, dtype=a.dtype) for k, a in self.port_dict.items()}

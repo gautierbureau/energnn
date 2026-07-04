@@ -72,11 +72,18 @@ class GNN(nnx.Module):
     def forward_batch(self, *, graph: Graph, get_info: bool = False) -> tuple[Graph | jax.Array, dict]:
         """Applies the model to a batch of graphs.
 
-        Only the encoder, coupler, and decoder modules are vmapped, while the normalization module is not.
+        Dense batches (built with :func:`~energnn.graph.collate_graphs`) are processed by
+        vmapping the encoder, coupler, and decoder over the batch axis, while the
+        normalization module is not vmapped. Disjoint-union batches (built with
+        :func:`~energnn.graph.union_graphs`) are single larger graphs and go through the
+        plain forward pass, which scales with the sum of instance sizes instead of
+        ``batch * max_size``.
 
         :param graph: Batch of input graphs.
         :param get_info: Whether to return additional information about the processing steps.
         """
+        if graph.segments is not None:
+            return self(graph=graph, get_info=get_info)
 
         def apply_core(encoder, coupler, decoder, graph, get_info):
             info = {}
