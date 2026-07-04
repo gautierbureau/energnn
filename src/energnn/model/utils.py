@@ -11,7 +11,7 @@ from typing import Callable
 import jax
 from flax import nnx
 from flax.nnx import initializers
-from flax.typing import Initializer
+from flax.typing import Dtype, Initializer
 
 Activation = Callable[[jax.Array], jax.Array]
 
@@ -28,6 +28,10 @@ class MLP(nnx.Module):
     :param kernel_init: Initializer function for the weights of each layer.
     :param bias_init: Initializer function for the bias terms of each layer.
     :param final_activation: Activation function applied after the final layer.
+    :param dtype: Computation dtype of the linear layers (e.g. ``jnp.bfloat16`` for mixed
+        precision). Inputs and parameters are cast to this dtype for the matmuls, while
+        the parameters themselves stay in their storage dtype (float32). None (default)
+        infers the computation dtype from the inputs and parameters (full precision).
     :param rngs: ``nnx.Rngs`` used to initialize sub-layers.
     :param seed: Optional seed for RNG streams used to initialize sub-layers.
     :return: Flax NNX module representing the MLP.
@@ -44,6 +48,7 @@ class MLP(nnx.Module):
         kernel_init: Initializer = initializers.lecun_normal(),
         bias_init: Initializer = initializers.zeros_init(),
         final_activation: Activation | None = None,
+        dtype: Dtype | None = None,
         rngs: nnx.Rngs | None = None,
         seed: int | None = None,
     ) -> None:
@@ -63,6 +68,7 @@ class MLP(nnx.Module):
         self.kernel_init = kernel_init
         self.bias_init = bias_init
         self.final_activation = final_activation
+        self.dtype = dtype
 
         if seed is not None:
             rngs = nnx.Rngs(seed)
@@ -83,6 +89,7 @@ class MLP(nnx.Module):
                     use_bias=self.use_bias,
                     kernel_init=self.kernel_init,
                     bias_init=self.bias_init,
+                    dtype=self.dtype,
                     rngs=rngs,
                 )
             )
