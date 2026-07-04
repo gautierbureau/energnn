@@ -100,15 +100,21 @@ class HyperEdgeSet(dict):
             backend = NumpyBackend()
         xp = backend.xp
 
-        # Validate on numpy (safe for both input types)
-        port_dict_np = check_dict_or_none(to_numpy(port_dict))
+        # Validate on numpy (safe for both input types).
+        # Ports keep their input dtype during validation so large integer addresses stay exact.
+        port_dict_np = check_dict_or_none(to_numpy(port_dict, dtype=None))
         feature_dict_np = check_dict_or_none(to_numpy(feature_dict))
 
         check_valid_ports(port_dict_np)
         check_no_nan(port_dict=port_dict_np, feature_dict=feature_dict_np)
 
-        # Convert to backend arrays
-        port_dict_b = {k: xp.array(v) for k, v in port_dict_np.items()} if port_dict_np is not None else None
+        # Convert to backend arrays. Port addresses are stored as int32, so downstream
+        # gather/scatter operations don't have to round-trip through float32.
+        port_dict_b = (
+            {k: xp.array(np.asarray(v).astype(np.int32)) for k, v in port_dict_np.items()}
+            if port_dict_np is not None
+            else None
+        )
 
         if feature_dict_np is not None:
             feature_names: dict | None = {name: idx for idx, name in enumerate(sorted(feature_dict_np))}
@@ -133,8 +139,10 @@ class HyperEdgeSet(dict):
 
     def to_backend(self, new_backend: Backend) -> HyperEdgeSet:
         """Return a copy of this ``HyperEdgeSet`` with arrays converted to ``new_backend``."""
+        # Port addresses and feature indices are integers; keep them as int32 instead of
+        # the backend's default float dtype.
         port_dict_b = (
-            {k: new_backend.from_numpy(np.array(v)) for k, v in self.port_dict.items()}
+            {k: new_backend.from_numpy(np.array(v), dtype="int32") for k, v in self.port_dict.items()}
             if self.port_dict is not None
             else None
         )
@@ -142,7 +150,7 @@ class HyperEdgeSet(dict):
             new_backend.from_numpy(np.array(self.feature_array)) if self.feature_array is not None else None
         )
         feature_names_b = (
-            {k: new_backend.from_numpy(np.array(v)) for k, v in self.feature_names.items()}
+            {k: new_backend.from_numpy(np.array(v), dtype="int32") for k, v in self.feature_names.items()}
             if self.feature_names is not None
             else None
         )
@@ -200,10 +208,14 @@ class HyperEdgeSet(dict):
         """Concatenate (features, ports) along the last axis."""
         xp = self._backend.xp
         parts = []
+        port_array = self.port_array
         if self.feature_array is not None:
             parts.append(self.feature_array)
-        if self.port_array is not None:
-            parts.append(self.port_array)
+            if port_array is not None:
+                # Cast integer ports to the feature dtype to avoid dtype promotion surprises.
+                port_array = port_array.astype(self.feature_array.dtype)
+        if port_array is not None:
+            parts.append(port_array)
         return xp.concatenate(parts, axis=-1)
 
     def _data_ndim(self) -> int:
@@ -369,7 +381,8 @@ class HyperEdgeSet(dict):
     def offset_addresses(self, offset) -> None:
         """Add ``offset`` to every port address; used before graph concatenation."""
         xp = self._backend.xp
-        self.port_dict = {k: a + xp.array(offset) for k, a in self.port_dict.items()}
+        # Cast the offset to each port array's dtype so integer addresses are not upcast.
+        self.port_dict = {k: a + xp.asarray(offset, dtype=a.dtype) for k, a in self.port_dict.items()}
 
 
 # ---------------------------------------------------------------------------

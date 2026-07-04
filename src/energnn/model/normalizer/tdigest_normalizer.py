@@ -264,6 +264,7 @@ class TDigestModule(nnx.Module):
         n_breakpoints: int,
         max_centroids: int,
         use_running_average: bool,
+        update_period: int = 1,
     ):
         """
         Initializes the TDigestModule.
@@ -273,14 +274,22 @@ class TDigestModule(nnx.Module):
         :param n_breakpoints: Number of points for the interpolation grid.
         :param max_centroids: Maximum number of centroids for the T-Digest.
         :param use_running_average: If True, skips updates and uses current state (inference mode).
+        :param update_period: Ingest new data only every ``update_period`` training calls.
+            Each ingestion is a host round-trip (io_callback) that synchronizes the device,
+            so values > 1 amortize that cost. The first call always ingests.
         """
+        if update_period < 1:
+            raise ValueError(f"update_period must be >= 1, got {update_period}")
+
         self.in_size = in_size
         self.update_limit = update_limit
         self.n_breakpoints = n_breakpoints
         self.max_centroids = max_centroids
         self.use_running_average = use_running_average
+        self.update_period = update_period
 
         self.updates = nnx.Variable(jnp.array([0], dtype=jnp.int32))
+        self.calls = nnx.Variable(jnp.array([0], dtype=jnp.int32))
 
         self.max_centroids_var = nnx.Variable(jnp.array([self.max_centroids] * self.in_size, dtype=jnp.int32))
         self.min_var = nnx.Variable(jnp.array([jnp.nan] * self.in_size, dtype=jnp.float32))
@@ -301,7 +310,9 @@ class TDigestModule(nnx.Module):
         :return: Normalized array of the same shape as input.
         """
         is_training = not self.use_running_average
-        should_update = is_training & (self.updates[...] < self.update_limit)[0]
+        should_update = (
+            is_training & (self.updates[...] < self.update_limit)[0] & (self.calls[...] % self.update_period == 0)[0]
+        )
 
         if is_training:
             module_state = (
@@ -325,6 +336,7 @@ class TDigestModule(nnx.Module):
             )
 
             # Update state variables (side effects)
+            self.calls[...] = self.calls[...] + 1
             self.updates[...] = jnp.where(should_update, self.updates[...] + 1, self.updates[...])
             self.max_centroids_var[...] = jax.lax.stop_gradient(new_vars[0])
             self.min_var[...] = jax.lax.stop_gradient(new_vars[1])
@@ -376,6 +388,7 @@ class TDigestNormalizer(Normalizer):
         n_breakpoints: int = 20,
         max_centroids: int = 1000,
         use_running_average: bool = False,
+        update_period: int = 1,
     ):
         """
         Initializes the TDigestNormalizer.
@@ -385,12 +398,16 @@ class TDigestNormalizer(Normalizer):
         :param n_breakpoints: Number of breakpoints for the interpolation grid.
         :param max_centroids: Maximum number of centroids for each T-Digest.
         :param use_running_average: Initial state for the running average flag.
+        :param update_period: Ingest new data only every ``update_period`` training calls.
+            Each ingestion is a host round-trip that synchronizes the device, so values > 1
+            amortize that cost while still tracking the feature distributions.
         """
         self.in_structure = in_structure
         self.update_limit = update_limit
         self.n_breakpoints = n_breakpoints
         self.max_centroids = max_centroids
         self.use_running_average = use_running_average
+        self.update_period = update_period
 
         self.module_dict = self._build_module_dict()
 
@@ -406,6 +423,7 @@ class TDigestNormalizer(Normalizer):
                     n_breakpoints=self.n_breakpoints,
                     max_centroids=self.max_centroids,
                     use_running_average=self.use_running_average,
+                    update_period=self.update_period,
                 )
             else:
                 module_dict[key] = None
