@@ -329,19 +329,21 @@ class Graph(dict):
         if q_list is None:
             q_list = [0.0, 10.0, 25.0, 50.0, 75.0, 90.0, 100.0]
         xp = self._backend.xp
+        if self.is_single:
+            axis = None
+        elif self.is_batch:
+            axis = 1
+        else:
+            raise ValueError("This graph is not single or batch and cannot be quantiled.")
         info = {}
         for object_name, hes in self.hyper_edge_sets.items():
-            if hes.feature_dict is not None:
-                for feature_name, array in hes.feature_dict.items():
+            feature_dict = hes.feature_dict
+            if feature_dict is not None:
+                for feature_name, array in feature_dict.items():
                     if xp.size(array) > 0:
-                        for q in q_list:
-                            if self.is_single:
-                                value = xp.nanpercentile(array, q=q)
-                            elif self.is_batch:
-                                value = xp.nanpercentile(array, q=q, axis=1)
-                            else:
-                                raise ValueError("This graph is not single or batch and cannot be quantiled.")
-                            info[f"{object_name}/{feature_name}/{q}th-percentile"] = value
+                        values = xp.nanpercentile(array, q=xp.array(q_list), axis=axis)
+                        for i, q in enumerate(q_list):
+                            info[f"{object_name}/{feature_name}/{q}th-percentile"] = values[i]
         return info
 
 
@@ -506,25 +508,24 @@ def get_statistics(graph: Graph, axis: int | None = None, norm_graph: Graph | No
 
     info = {}
     for object_name, hes in graph.hyper_edge_sets.items():
-        if hes.feature_dict is not None:
-            for feature_name, array in hes.feature_dict.items():
+        feature_dict = hes.feature_dict
+        if feature_dict is not None:
+            norm_feature_dict = norm_graph.hyper_edge_sets[object_name].feature_dict if norm_graph is not None else None
+            for feature_name, array in feature_dict.items():
                 if array.size == 0:
                     array = xp.array([[0.0]]) if axis == 1 else xp.array([0.0])
 
                 rmse = xp.sqrt(xp.nanmean(array**2, axis=axis))
                 info["{}/{}/rmse".format(object_name, feature_name)] = rmse
-                if norm_graph is not None:
-                    norm_array = norm_graph.hyper_edge_sets[object_name].feature_dict[feature_name]
+                mae = xp.nanmean(xp.abs(array), axis=axis)
+                info["{}/{}/mae".format(object_name, feature_name)] = mae
+
+                if norm_feature_dict is not None:
+                    norm_array = norm_feature_dict[feature_name]
                     norm_array = norm_array - xp.nanmean(norm_array)
                     info["{}/{}/nrmse".format(object_name, feature_name)] = rmse / (
                         xp.sqrt(xp.nanmean(norm_array**2, axis=axis)) + 1e-9
                     )
-
-                mae = xp.nanmean(xp.abs(array), axis=axis)
-                info["{}/{}/mae".format(object_name, feature_name)] = mae
-                if norm_graph is not None:
-                    norm_array = norm_graph.hyper_edge_sets[object_name].feature_dict[feature_name]
-                    norm_array = norm_array - xp.nanmean(norm_array)
                     info["{}/{}/nmae".format(object_name, feature_name)] = mae / (
                         xp.nanmean(xp.abs(norm_array), axis=axis) + 1e-9
                     )
@@ -532,10 +533,11 @@ def get_statistics(graph: Graph, axis: int | None = None, norm_graph: Graph | No
                 info["{}/{}/mean".format(object_name, feature_name)] = xp.nanmean(array, axis=axis)
                 info["{}/{}/std".format(object_name, feature_name)] = xp.nanstd(array, axis=axis)
                 info["{}/{}/max".format(object_name, feature_name)] = xp.nanmax(array, axis=axis)
-                info["{}/{}/90th".format(object_name, feature_name)] = xp.nanpercentile(array, q=90, axis=axis)
-                info["{}/{}/75th".format(object_name, feature_name)] = xp.nanpercentile(array, q=75, axis=axis)
-                info["{}/{}/50th".format(object_name, feature_name)] = xp.nanpercentile(array, q=50, axis=axis)
-                info["{}/{}/25th".format(object_name, feature_name)] = xp.nanpercentile(array, q=25, axis=axis)
-                info["{}/{}/10th".format(object_name, feature_name)] = xp.nanpercentile(array, q=10, axis=axis)
+                percentiles = xp.nanpercentile(array, q=xp.array([90.0, 75.0, 50.0, 25.0, 10.0]), axis=axis)
+                info["{}/{}/90th".format(object_name, feature_name)] = percentiles[0]
+                info["{}/{}/75th".format(object_name, feature_name)] = percentiles[1]
+                info["{}/{}/50th".format(object_name, feature_name)] = percentiles[2]
+                info["{}/{}/25th".format(object_name, feature_name)] = percentiles[3]
+                info["{}/{}/10th".format(object_name, feature_name)] = percentiles[4]
                 info["{}/{}/min".format(object_name, feature_name)] = xp.nanmin(array, axis=axis)
     return info

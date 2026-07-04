@@ -100,15 +100,21 @@ class HyperEdgeSet(dict):
             backend = NumpyBackend()
         xp = backend.xp
 
-        # Validate on numpy (safe for both input types)
-        port_dict_np = check_dict_or_none(to_numpy(port_dict))
+        # Validate on numpy (safe for both input types).
+        # Ports keep their input dtype during validation so large integer addresses stay exact.
+        port_dict_np = check_dict_or_none(to_numpy(port_dict, dtype=None))
         feature_dict_np = check_dict_or_none(to_numpy(feature_dict))
 
         check_valid_ports(port_dict_np)
         check_no_nan(port_dict=port_dict_np, feature_dict=feature_dict_np)
 
-        # Convert to backend arrays
-        port_dict_b = {k: xp.array(v) for k, v in port_dict_np.items()} if port_dict_np is not None else None
+        # Convert to backend arrays. Port addresses are stored as int32, so downstream
+        # gather/scatter operations don't have to round-trip through float32.
+        port_dict_b = (
+            {k: xp.array(np.asarray(v).astype(np.int32)) for k, v in port_dict_np.items()}
+            if port_dict_np is not None
+            else None
+        )
 
         if feature_dict_np is not None:
             feature_names: dict | None = {name: idx for idx, name in enumerate(sorted(feature_dict_np))}
@@ -133,8 +139,10 @@ class HyperEdgeSet(dict):
 
     def to_backend(self, new_backend: Backend) -> HyperEdgeSet:
         """Return a copy of this ``HyperEdgeSet`` with arrays converted to ``new_backend``."""
+        # Port addresses and feature indices are integers; keep them as int32 instead of
+        # the backend's default float dtype.
         port_dict_b = (
-            {k: new_backend.from_numpy(np.array(v)) for k, v in self.port_dict.items()}
+            {k: new_backend.from_numpy(np.array(v), dtype="int32") for k, v in self.port_dict.items()}
             if self.port_dict is not None
             else None
         )
@@ -142,7 +150,7 @@ class HyperEdgeSet(dict):
             new_backend.from_numpy(np.array(self.feature_array)) if self.feature_array is not None else None
         )
         feature_names_b = (
-            {k: new_backend.from_numpy(np.array(v)) for k, v in self.feature_names.items()}
+            {k: new_backend.from_numpy(np.array(v), dtype="int32") for k, v in self.feature_names.items()}
             if self.feature_names is not None
             else None
         )
@@ -200,37 +208,52 @@ class HyperEdgeSet(dict):
         """Concatenate (features, ports) along the last axis."""
         xp = self._backend.xp
         parts = []
+        port_array = self.port_array
         if self.feature_array is not None:
             parts.append(self.feature_array)
-        if self.port_array is not None:
-            parts.append(self.port_array)
+            if port_array is not None:
+                # Cast integer ports to the feature dtype to avoid dtype promotion surprises.
+                port_array = port_array.astype(self.feature_array.dtype)
+        if port_array is not None:
+            parts.append(port_array)
         return xp.concatenate(parts, axis=-1)
+
+    def _data_ndim(self) -> int:
+        """Number of dimensions of ``array`` (2 for single, 3 for batch), computed without concatenating."""
+        if self.feature_array is not None:
+            return len(self.feature_array.shape)
+        if self.port_dict is not None and self.port_dict:
+            return len(next(iter(self.port_dict.values())).shape) + 1
+        return len(self.non_fictitious.shape) + 1
 
     @property
     def is_batch(self) -> bool:
         """True if ``array`` is 3-D: ``(batch, n_obj, features+ports)``."""
-        return len(self.array.shape) == 3
+        return self._data_ndim() == 3
 
     @property
     def is_single(self) -> bool:
         """True if ``array`` is 2-D: ``(n_obj, features+ports)``."""
-        return len(self.array.shape) == 2
+        return self._data_ndim() == 2
 
     @property
     def n_obj(self) -> int:
         """Number of hyper-edges per instance."""
-        if self.is_single:
-            return int(self.array.shape[0])
-        elif self.is_batch:
-            return int(self.array.shape[1])
-        else:
-            raise ValueError("HyperEdgeSet is neither single nor batched.")
+        if self.feature_array is not None:
+            return int(self.feature_array.shape[-2])
+        if self.port_dict is not None and self.port_dict:
+            return int(next(iter(self.port_dict.values())).shape[-1])
+        return int(self.non_fictitious.shape[-1])
 
     @property
     def n_batch(self) -> int:
         """Number of batches; valid only when ``is_batch`` is True."""
         if self.is_batch:
-            return int(self.array.shape[0])
+            if self.feature_array is not None:
+                return int(self.feature_array.shape[0])
+            if self.port_dict is not None and self.port_dict:
+                return int(next(iter(self.port_dict.values())).shape[0])
+            return int(self.non_fictitious.shape[0])
         raise ValueError("HyperEdgeSet is not batched.")
 
     # ------------------------------------------------------------------
@@ -287,12 +310,11 @@ class HyperEdgeSet(dict):
         if not self.feature_names:
             return None
         xp = self._backend.xp
+        is_batch = self.is_batch
         result = {}
         for k, v in self.feature_names.items():
-            if self.is_batch:
-                result[k] = self.feature_array[..., xp.array(v[0], int)]
-            else:
-                result[k] = self.feature_array[..., xp.array(v, int)]
+            idx = v[0] if is_batch else v
+            result[k] = self.feature_array[..., xp.array(idx, int)]
         return result
 
     @property
@@ -359,7 +381,8 @@ class HyperEdgeSet(dict):
     def offset_addresses(self, offset) -> None:
         """Add ``offset`` to every port address; used before graph concatenation."""
         xp = self._backend.xp
-        self.port_dict = {k: a + xp.array(offset) for k, a in self.port_dict.items()}
+        # Cast the offset to each port array's dtype so integer addresses are not upcast.
+        self.port_dict = {k: a + xp.asarray(offset, dtype=a.dtype) for k, a in self.port_dict.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -592,11 +615,11 @@ def _compute_n_objects(port_dict: dict | None, feature_dict: dict | None) -> int
 
 
 def _check_keys_consistency(hes_1: HyperEdgeSet, hes_2: HyperEdgeSet) -> None:
-    if (hes_1.port_names is None) != (hes_2.port_names is None):
+    if (hes_1.port_dict is None) != (hes_2.port_dict is None):
         raise ValueError("Mismatch in presence of port_names among hyper-edge sets.")
     if (hes_1.feature_names is None) != (hes_2.feature_names is None):
         raise ValueError("Mismatch in presence of feature_names among hyper-edge sets.")
-    if hes_1.port_names and hes_1.port_names.keys() != hes_2.port_names.keys():
+    if hes_1.port_dict and hes_1.port_dict.keys() != hes_2.port_dict.keys():
         raise ValueError("Inconsistent port_names keys among hyper-edge sets.")
     if hes_1.feature_names and hes_1.feature_names.keys() != hes_2.feature_names.keys():
         raise ValueError("Inconsistent feature_names keys among hyper-edge sets.")
