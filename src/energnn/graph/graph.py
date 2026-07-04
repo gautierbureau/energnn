@@ -425,12 +425,27 @@ def collate_graphs(graph_list: list[Graph]) -> Graph:
         else None
     )
 
+    with_segments = [g.segments is not None for g in graph_list]
+    if any(with_segments) and not all(with_segments):
+        raise ValueError("Cannot collate graphs where only some carry union segment metadata.")
+    segments_batch = None
+    if all(with_segments):
+        segments_batch = {
+            ADDRESS_GRAPH_IDS: xp.stack([g.segments[ADDRESS_GRAPH_IDS] for g in graph_list], axis=0),
+            HYPER_EDGE_GRAPH_IDS: {
+                k: xp.stack([g.segments[HYPER_EDGE_GRAPH_IDS][k] for g in graph_list], axis=0)
+                for k in first.segments[HYPER_EDGE_GRAPH_IDS]
+            },
+            TRUE_SHAPES: collate_shapes([g.segments[TRUE_SHAPES] for g in graph_list]),
+        }
+
     return cls(
         backend=backend,
         hyper_edge_sets=hes_batch,
         non_fictitious_addresses=nfa_batch,
         true_shape=true_shape_batch,
         current_shape=current_shape_batch,
+        segments=segments_batch,
     )
 
 
@@ -459,9 +474,34 @@ def separate_graphs(graph_batch: Graph) -> list[Graph]:
 
     hes_dict_list = [{k: hes_list_dict[k][i] for k in hes_list_dict} for i in range(n_batch)]
 
+    if graph_batch.segments is not None:
+        address_ids_list = xp.unstack(graph_batch.segments[ADDRESS_GRAPH_IDS], axis=0)
+        hyper_edge_ids = {k: xp.unstack(v, axis=0) for k, v in graph_batch.segments[HYPER_EDGE_GRAPH_IDS].items()}
+        # The per-instance true shapes gain a leading batch axis when collated, so they
+        # are unstacked directly (separate_shapes expects singly-batched shapes).
+        batched_true_shapes = graph_batch.segments[TRUE_SHAPES]
+        true_shapes_list = [
+            GraphShape(
+                backend=backend,
+                hyper_edge_sets={k: v[i] for k, v in batched_true_shapes.hyper_edge_sets.items()},
+                addresses=batched_true_shapes.addresses[i],
+            )
+            for i in range(n_batch)
+        ]
+        segments_list: list = [
+            {
+                ADDRESS_GRAPH_IDS: address_ids_list[i],
+                HYPER_EDGE_GRAPH_IDS: {k: hyper_edge_ids[k][i] for k in hyper_edge_ids},
+                TRUE_SHAPES: true_shapes_list[i],
+            }
+            for i in range(n_batch)
+        ]
+    else:
+        segments_list = [None] * n_batch
+
     return [
-        cls(backend=backend, hyper_edge_sets=e, non_fictitious_addresses=n, true_shape=t, current_shape=c)
-        for e, n, t, c in zip(hes_dict_list, nfa_list, true_shape_list, current_shape_list)
+        cls(backend=backend, hyper_edge_sets=e, non_fictitious_addresses=n, true_shape=t, current_shape=c, segments=s)
+        for e, n, t, c, s in zip(hes_dict_list, nfa_list, true_shape_list, current_shape_list, segments_list)
     ]
 
 
