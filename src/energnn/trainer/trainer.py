@@ -49,9 +49,20 @@ def _cast_cotangent_to_primal_dtype(cotangent_pytree, primal_pytree):
     return jax.tree.map(_cast_leaf, cotangent_pytree, primal_pytree)
 
 
-def _update_params_fn(optimizer: nnx.Optimizer, model: GNN, gradient: nnx.State) -> None:
-    """JIT-compatible function that applies the optimizer update."""
+def _functional_update(opt_graphdef, opt_state, model_graphdef, params, rest, gradient):
+    """Functional optimizer update, designed to be JIT-compiled once and reused.
+
+    Operates on split pytrees instead of NNX modules: passing the modules through
+    ``nnx.jit`` would re-flatten the model and optimizer graphs on every call, which
+    dominates the host-side cost of a training step. The parameter and optimizer-state
+    buffers are donated by the caller, so the update happens in place on device.
+    """
+    optimizer = nnx.merge(opt_graphdef, opt_state)
+    model = nnx.merge(model_graphdef, params, rest)
     optimizer.update(model, gradient)
+    _, new_params, _ = nnx.split(model, nnx.Param, ...)
+    _, new_opt_state = nnx.split(optimizer)
+    return new_params, new_opt_state
 
 
 def _setup_ckpt_mngr(checkpoint_manager: CheckpointManager, optim_mode: Literal["minimize", "maximize"]):
@@ -106,7 +117,9 @@ class Trainer:
         self._jit_apply = nnx.jit(self._apply_forward_vjp, static_argnames=("get_info",))
         self._jit_backward = jax.jit(self._backward_from_vjp)
         self._jit_eval_forward = nnx.jit(self._eval_forward)
-        self._jit_update_params = nnx.jit(_update_params_fn)
+        # Parameter and optimizer-state buffers are donated so XLA can update them
+        # in place instead of allocating fresh buffers.
+        self._jit_update_params = nnx.jit(_functional_update, donate_argnums=(1, 3))
 
     @staticmethod
     def _apply_forward_vjp(graphdef, params, rest, jax_context, get_info):
@@ -407,7 +420,12 @@ class Trainer:
             _sync_and_log("backward", t_start, grads_params)
 
             t_start = time.perf_counter()
-            self._jit_update_params(self.optimizer, self.model, grads_params)
+            opt_graphdef, opt_state = nnx.split(self.optimizer)
+            new_params, new_opt_state = self._jit_update_params(
+                opt_graphdef, opt_state, graphdef, params, rest_updated, grads_params
+            )
+            nnx.update(self.model, new_params)
+            nnx.update(self.optimizer, new_opt_state)
             if log_timings:
                 jax.block_until_ready(nnx.state(self.model))
             _sync_and_log("update_params", t_start)
