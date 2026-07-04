@@ -27,6 +27,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
         n_steps: int = 5,
         seed: int = 0,
         normalizer_update_period: int = 1,
+        remat: bool = False,
     ):
 
         rngs = nnx.Rngs(seed)
@@ -75,6 +76,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             phi=phi,
             message_functions=[message_function],
             n_steps=n_steps,
+            remat=remat,
         )
 
         decoder = MLPEquivariantDecoder(

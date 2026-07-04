@@ -36,6 +36,10 @@ class RecurrentCoupler(Coupler):
     :param phi: Outer MLP :math:`\phi_\theta`.
     :param message_functions: List of message functions :math:`(\psi^i_\theta)_i`.
     :param n_steps: Number of message passing steps.
+    :param remat: If true, apply gradient checkpointing (rematerialization) to each
+        message passing step. The backward pass then recomputes step activations
+        instead of storing all ``n_steps`` of them, trading extra compute for
+        activation memory that no longer grows with ``n_steps``.
     """
 
     def __init__(
@@ -43,11 +47,13 @@ class RecurrentCoupler(Coupler):
         phi: MLP,
         message_functions: list[MessagePassingFunction],
         n_steps: int,
+        remat: bool = False,
     ):
         super().__init__()
         self.phi = phi
         self.message_functions = nnx.List(message_functions)
         self.n_steps = n_steps
+        self.remat = remat
 
         self.dt = 1 / self.n_steps
 
@@ -68,6 +74,9 @@ class RecurrentCoupler(Coupler):
 
         def step(carry, _):
             return carry + dt * F(0, carry, graph), None
+
+        if self.remat:
+            step = jax.checkpoint(step)
 
         # lax.scan keeps the compiled program size constant in n_steps,
         # instead of unrolling the message-passing block n_steps times.

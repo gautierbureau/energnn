@@ -116,7 +116,7 @@ class Trainer:
         # `get_info` is static because downstream code branches on its concrete value.
         self._jit_apply = nnx.jit(self._apply_forward_vjp, static_argnames=("get_info",))
         self._jit_backward = jax.jit(self._backward_from_vjp)
-        self._jit_eval_forward = nnx.jit(self._eval_forward)
+        self._jit_eval_forward = nnx.jit(self._eval_forward, static_argnames=("get_info",))
         # Parameter and optimizer-state buffers are donated so XLA can update them
         # in place instead of allocating fresh buffers.
         self._jit_update_params = nnx.jit(_functional_update, donate_argnums=(1, 3))
@@ -150,9 +150,9 @@ class Trainer:
         return grads_params
 
     @staticmethod
-    def _eval_forward(model, context):
+    def _eval_forward(model, context, get_info: bool = True):
         """Forward pass for evaluation, designed to be JIT-compiled once and reused."""
-        decision, info = model.forward_batch(graph=context, get_info=True)
+        decision, info = model.forward_batch(graph=context, get_info=get_info)
         _, _, r_updated = nnx.split(model, nnx.Param, ...)
         return decision, info, r_updated
 
@@ -267,7 +267,10 @@ class Trainer:
         """
         self.model.eval()  # Set model to eval mode
 
-        mean_score, infos = self.eval(val_loader, progress_bar=progress_bar, position=position)
+        # Detailed per-feature statistics are only consumed by the tracker; skip
+        # computing them (quantiles inside the jitted forward + host transfers)
+        # when there is no tracker to report them to.
+        mean_score, infos = self.eval(val_loader, progress_bar=progress_bar, position=position, get_info=tracker is not None)
         if self.best_score is None:
             self.best_score = mean_score
         else:
@@ -327,13 +330,18 @@ class Trainer:
         nnx.update(self.optimizer, restored["optimizer"])
         self.train_step = restored["step"]
 
-    def eval(self, loader: ProblemLoader, progress_bar: bool = False, position: int = 0) -> tuple[float, dict]:
+    def eval(
+        self, loader: ProblemLoader, progress_bar: bool = False, position: int = 0, get_info: bool = True
+    ) -> tuple[float, dict]:
         """
         Evaluates the amortizer over a problem loader by averaging the score scalar.
 
         :param loader: Problem loader over which the amortizer is evaluated.
         :param progress_bar: If true, display a progress bar during evaluation.
         :param position: Position of the progress bar if shown.
+        :param get_info: If true, collect detailed per-feature statistics for each batch.
+            Disabling it skips the quantile computations and host transfers, which
+            speeds up evaluation when only the score is needed.
         :return: Average score obtained over the problem loader.
         """
         score_list, infos_list = [], []
@@ -341,7 +349,7 @@ class Trainer:
         score_sum, score_count = 0.0, 0
         pbar = tqdm(loader, desc="Validation", unit="batch", leave=True, disable=not progress_bar, position=position)
         for step, problem_batch in enumerate(pbar):
-            score_batch, info_batch = self.eval_step(step, problem_batch)
+            score_batch, info_batch = self.eval_step(step, problem_batch, get_info=get_info)
             score_list.append(score_batch)
             infos_list.append(info_batch)
             if progress_bar:
@@ -438,21 +446,24 @@ class Trainer:
 
         return infos
 
-    def eval_step(self, eval_step: int, problem_batch: ProblemBatch) -> tuple[list[float], dict]:
+    def eval_step(self, eval_step: int, problem_batch: ProblemBatch, get_info: bool = True) -> tuple[list[float], dict]:
         """Evaluates the current gnn over a batch of problems.
 
         :param eval_step: Index of the current evaluation step.
         :param problem_batch: A problem batch.
+        :param get_info: If true, collect detailed per-feature statistics.
         :return: A batch of scores and a dictionary of batched information.
         """
         with TaskLogger(logger, f"Eval step {eval_step}"):
             infos = {}
 
-            jax_context, infos["1_context"] = problem_batch.get_context(get_info=True, step=self.train_step)
+            jax_context, infos["1_context"] = problem_batch.get_context(get_info=get_info, step=self.train_step)
 
-            jax_decision, infos["2_forward"], rest_updated = self._jit_eval_forward(model=self.model, context=jax_context)
+            jax_decision, infos["2_forward"], rest_updated = self._jit_eval_forward(
+                model=self.model, context=jax_context, get_info=get_info
+            )
 
-            score, infos["3_score"] = problem_batch.get_score(decision=jax_decision, get_info=True, step=self.train_step)
+            score, infos["3_score"] = problem_batch.get_score(decision=jax_decision, get_info=get_info, step=self.train_step)
 
         # Flatten and numpify infos
         infos = flatdict.FlatDict(infos, delimiter="/")

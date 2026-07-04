@@ -153,18 +153,17 @@ def _generate_sparse_linear_system(n, m):
         weight = np.random.rand() + 0.5
         B[u, v] = B[v, u] = -weight
 
-    # Add remaining m - (n-1) edges
-    possible_edges = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if B[i, j] == 0:
-                possible_edges.append((i, j))
+    # Add remaining m - (n-1) edges. Candidate edges are the empty upper-triangular
+    # entries, enumerated in row-major order (same order as the previous Python loop).
+    iu, ju = np.triu_indices(n, k=1)
+    free = B[iu, ju] == 0
+    possible_u, possible_v = iu[free], ju[free]
 
-    if possible_edges and m > n - 1:
-        n_extra = min(m - (n - 1), len(possible_edges))
-        idx = np.random.choice(len(possible_edges), n_extra, replace=False)
+    if len(possible_u) > 0 and m > n - 1:
+        n_extra = min(m - (n - 1), len(possible_u))
+        idx = np.random.choice(len(possible_u), n_extra, replace=False)
         for i in idx:
-            u, v = possible_edges[i]
+            u, v = possible_u[i], possible_v[i]
             weight = np.random.rand() + 0.5
             B[u, v] = B[v, u] = -weight
 
