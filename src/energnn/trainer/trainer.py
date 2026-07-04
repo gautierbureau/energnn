@@ -106,11 +106,30 @@ class Trainer:
         *,
         model: GNN,
         gradient_transformation: GradientTransformation,
+        mesh: jax.sharding.Mesh | None = None,
     ):
+        """
+        :param model: Core Graph Neural Network model.
+        :param gradient_transformation: Optax gradient transformation.
+        :param mesh: Optional 1-D device mesh for data-parallel training. When provided,
+            every context batch is sharded along its leading (batch) axis across the
+            mesh before the forward pass, parameters stay replicated, and XLA inserts
+            the gradient all-reduce automatically. The batch axis must be divisible by
+            the number of devices. Pairs naturally with batches of per-device disjoint
+            unions (see :func:`~energnn.graph.union_graphs`), where message passing
+            needs no cross-device communication at all.
+        """
         self.model: GNN = model
         self.optimizer = nnx.Optimizer(self.model, gradient_transformation, wrt=nnx.Param)
         self.train_step: int = 0
         self.best_score: float | None = None
+        self.mesh = mesh
+        if mesh is not None:
+            if len(mesh.axis_names) != 1:
+                raise ValueError(f"Trainer expects a 1-D data-parallel mesh, got axes {mesh.axis_names}.")
+            self._data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(mesh.axis_names[0]))
+        else:
+            self._data_sharding = None
 
         # Cache JIT-compiled wrappers to avoid NNX re-tracing overhead each step.
         # `get_info` is static because downstream code branches on its concrete value.
@@ -401,6 +420,8 @@ class Trainer:
             infos = {}
             t_start = time.perf_counter()
             jax_context, infos["1_context"] = problem_batch.get_context(get_info=get_info, step=self.train_step)
+            if self._data_sharding is not None:
+                jax_context = jax.device_put(jax_context, self._data_sharding)
             _sync_and_log("get_context", t_start, jax_context)
 
             # Host-side normalizer statistics update (no-op unless the model's normalizer
@@ -466,6 +487,8 @@ class Trainer:
             infos = {}
 
             jax_context, infos["1_context"] = problem_batch.get_context(get_info=get_info, step=self.train_step)
+            if self._data_sharding is not None:
+                jax_context = jax.device_put(jax_context, self._data_sharding)
 
             jax_decision, infos["2_forward"], rest_updated = self._jit_eval_forward(
                 model=self.model, context=jax_context, get_info=get_info

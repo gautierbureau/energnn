@@ -77,12 +77,14 @@ class GNN(nnx.Module):
         normalization module is not vmapped. Disjoint-union batches (built with
         :func:`~energnn.graph.union_graphs`) are single larger graphs and go through the
         plain forward pass, which scales with the sum of instance sizes instead of
-        ``batch * max_size``.
+        ``batch * max_size``. A *batched* graph of unions (one union per device, built
+        with ``collate_graphs`` over unions) takes the vmapped path, with each lane
+        processing one union — the layout used for multi-device data parallelism.
 
         :param graph: Batch of input graphs.
         :param get_info: Whether to return additional information about the processing steps.
         """
-        if graph.segments is not None:
+        if graph.segments is not None and graph.is_single:
             return self(graph=graph, get_info=get_info)
 
         def apply_core(encoder, coupler, decoder, graph, get_info):

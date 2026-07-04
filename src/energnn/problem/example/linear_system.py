@@ -10,7 +10,7 @@ import numpy as np
 from omegaconf import DictConfig
 
 from energnn.graph import GraphStructure, HyperEdgeSetStructure
-from energnn.graph import HYPER_EDGE_GRAPH_IDS, Graph, GraphShape, HyperEdgeSet, collate_graphs, union_graphs
+from energnn.graph import HYPER_EDGE_GRAPH_IDS, TRUE_SHAPES, Graph, GraphShape, HyperEdgeSet, collate_graphs, union_graphs
 from ..batch import ProblemBatch
 from ..loader import ProblemLoader
 from ..problem import Problem
@@ -84,21 +84,37 @@ class LinearSystemProblemBatch(ProblemBatch):
 
         For dense batches, the mean runs over each instance's padded rows (batch axis 1).
         For disjoint-union batches, per-instance means are computed with segment
-        reductions over the real (non-fictitious) entries only.
+        reductions over the real (non-fictitious) entries only. For *batched* unions
+        (one union per device shard), per-shard scores are computed with a vmap and
+        flattened back to the original instance order, dropping padded empty instances.
         """
         if self.oracle.segments is not None:
             segments = self.oracle.segments
-            n_graphs = self.oracle.n_union_graphs
-            numerator = jnp.zeros(n_graphs)
-            denominator = jnp.zeros(n_graphs)
-            for key, hes in decision.hyper_edge_sets.items():
-                ids = segments[HYPER_EDGE_GRAPH_IDS][key].astype(int)
-                oracle_hes = self.oracle.hyper_edge_sets[key]
-                error = jnp.sum(jnp.square(hes.feature_array - oracle_hes.feature_array), axis=-1)
-                mask = oracle_hes.non_fictitious
-                numerator = numerator.at[ids].add(error * mask, mode="drop")
-                denominator = denominator.at[ids].add(mask * hes.feature_array.shape[-1], mode="drop")
-            objective = numerator / jnp.maximum(denominator, 1.0)
+            true_addresses = jnp.asarray(segments[TRUE_SHAPES].addresses)
+            n_graphs = true_addresses.shape[-1]
+
+            features = {k: hes.feature_array for k, hes in decision.hyper_edge_sets.items()}
+            oracle_features = {k: self.oracle.hyper_edge_sets[k].feature_array for k in features}
+            masks = {k: self.oracle.hyper_edge_sets[k].non_fictitious for k in features}
+            ids = {k: segments[HYPER_EDGE_GRAPH_IDS][k] for k in features}
+
+            def union_scores(features, oracle_features, masks, ids):
+                numerator = jnp.zeros(n_graphs)
+                denominator = jnp.zeros(n_graphs)
+                for key in features:
+                    error = jnp.sum(jnp.square(features[key] - oracle_features[key]), axis=-1)
+                    numerator = numerator.at[ids[key].astype(int)].add(error * masks[key], mode="drop")
+                    denominator = denominator.at[ids[key].astype(int)].add(masks[key] * features[key].shape[-1], mode="drop")
+                return numerator / jnp.maximum(denominator, 1.0)
+
+            if true_addresses.ndim == 2:
+                # Batched unions (one per device shard): instances were packed
+                # contiguously, so flattening restores the original order; padded empty
+                # instance slots (zero addresses) are dropped by the mask.
+                objective = jax.vmap(union_scores)(features, oracle_features, masks, ids).reshape(-1)
+                objective = objective[jnp.reshape(true_addresses > 0, -1)]
+            else:
+                objective = union_scores(features, oracle_features, masks, ids)
             return objective.tolist(), {}
 
         gradient = _tree_copy(decision)
@@ -246,7 +262,7 @@ class LinearSystemProblemGenerator:
         context, oracle = self._generate_numpy_problem()
         return LinearSystemProblem(context=Graph.to_jax_backend(context), oracle=Graph.to_jax_backend(oracle))
 
-    def generate_problem_batch(self, batch_size: int = 8, mode: str = "dense") -> LinearSystemProblemBatch:
+    def generate_problem_batch(self, batch_size: int = 8, mode: str = "dense", n_shards: int = 1) -> LinearSystemProblemBatch:
         """Generate a batch of problems.
 
         :param batch_size: Number of problem instances in the batch.
@@ -254,6 +270,11 @@ class LinearSystemProblemGenerator:
             along a batch axis (processed with vmap). ``"union"`` concatenates the
             unpadded instances into one disjoint-union graph padded to a power-of-two
             total-size bucket, so compute scales with the actual total size.
+        :param n_shards: Union mode only. With ``n_shards > 1``, instances are packed
+            contiguously into ``n_shards`` equal-budget unions collated along a leading
+            axis — one union per device for data-parallel training (shard the batch
+            with the trainer's ``mesh``). Ports never cross instances, so message
+            passing needs no cross-device communication.
         """
         context_list, oracle_list = [], []
 
@@ -263,6 +284,8 @@ class LinearSystemProblemGenerator:
             oracle_list.append(oracle)
 
         if mode == "dense":
+            if n_shards != 1:
+                raise ValueError("n_shards > 1 requires mode='union'.")
             max_context_shape = GraphShape(
                 hyper_edge_sets={
                     "line": np.array(self.n_max * (self.n_max - 1) // 2),
@@ -279,19 +302,43 @@ class LinearSystemProblemGenerator:
             context_batch = Graph.to_jax_backend(collate_graphs(context_list))
             oracle_batch = Graph.to_jax_backend(collate_graphs(oracle_list))
         elif mode == "union":
-            # Bucket the union budgets to powers of two, so training compiles a handful
-            # of shape variants instead of one per batch.
-            line_budget = _next_power_of_two(sum(int(g.true_shape.hyper_edge_sets["line"]) for g in context_list))
-            bus_budget = _next_power_of_two(sum(int(g.true_shape.hyper_edge_sets["bus"]) for g in context_list))
-            address_budget = _next_power_of_two(sum(len(g.non_fictitious_addresses) for g in context_list))
+            if n_shards < 1:
+                raise ValueError(f"n_shards must be >= 1, got {n_shards}")
+            if batch_size < n_shards:
+                raise ValueError(f"batch_size ({batch_size}) must be >= n_shards ({n_shards}).")
+            # Pack instances contiguously into balanced shards (no shard is empty);
+            # smaller shards are padded with empty instance slots up to the capacity.
+            base, extra = divmod(batch_size, n_shards)
+            sizes = [base + (1 if d < extra else 0) for d in range(n_shards)]
+            offsets = np.concatenate([[0], np.cumsum(sizes)])
+            capacity = sizes[0]
+            context_chunks = [context_list[offsets[d] : offsets[d + 1]] for d in range(n_shards)]
+            oracle_chunks = [oracle_list[offsets[d] : offsets[d + 1]] for d in range(n_shards)]
+
+            # Bucket the union budgets to powers of two over the largest shard, so
+            # training compiles a handful of shape variants instead of one per batch,
+            # and all shards share one padded shape (required to collate them).
+            def _budget(chunks, count):
+                return _next_power_of_two(max(count(chunk) for chunk in chunks))
+
+            line_budget = _budget(context_chunks, lambda c: sum(int(g.true_shape.hyper_edge_sets["line"]) for g in c))
+            bus_budget = _budget(context_chunks, lambda c: sum(int(g.true_shape.hyper_edge_sets["bus"]) for g in c))
+            address_budget = _budget(context_chunks, lambda c: sum(len(g.non_fictitious_addresses) for g in c))
             context_shape = GraphShape(
                 hyper_edge_sets={"line": np.array(line_budget), "bus": np.array(bus_budget)},
                 addresses=np.array(address_budget),
             )
             oracle_shape = GraphShape(hyper_edge_sets={"bus": np.array(bus_budget)}, addresses=np.array(address_budget))
 
-            context_batch = Graph.to_jax_backend(union_graphs(context_list, target_shape=context_shape))
-            oracle_batch = Graph.to_jax_backend(union_graphs(oracle_list, target_shape=oracle_shape))
+            context_unions = [union_graphs(chunk, target_shape=context_shape, n_graphs=capacity) for chunk in context_chunks]
+            oracle_unions = [union_graphs(chunk, target_shape=oracle_shape, n_graphs=capacity) for chunk in oracle_chunks]
+
+            if n_shards == 1:
+                context_batch = Graph.to_jax_backend(context_unions[0])
+                oracle_batch = Graph.to_jax_backend(oracle_unions[0])
+            else:
+                context_batch = Graph.to_jax_backend(collate_graphs(context_unions))
+                oracle_batch = Graph.to_jax_backend(collate_graphs(oracle_unions))
         else:
             raise ValueError(f"Unknown batching mode: {mode!r}, expected 'dense' or 'union'.")
 
@@ -309,15 +356,19 @@ class LinearSystemProblemLoader(ProblemLoader):
         n_max: int = 4,
         shuffle: bool = False,
         mode: str = "dense",
+        n_shards: int = 1,
     ):
         if mode not in ("dense", "union"):
             raise ValueError(f"Unknown batching mode: {mode!r}, expected 'dense' or 'union'.")
+        if n_shards != 1 and mode != "union":
+            raise ValueError("n_shards > 1 requires mode='union'.")
         self.seed = seed
         self.dataset_size = dataset_size
         self.batch_size = batch_size
         self.n_max = n_max
         self.shuffle = shuffle
         self.mode = mode
+        self.n_shards = n_shards
         self.len = dataset_size
         self.current_step = 0
 
@@ -343,7 +394,7 @@ class LinearSystemProblemLoader(ProblemLoader):
         batch_end = min(self.current_step + self.batch_size, self.len)
         self.current_step = batch_end
         n_batch = batch_end - batch_start
-        batch = self.generator.generate_problem_batch(batch_size=n_batch, mode=self.mode)
+        batch = self.generator.generate_problem_batch(batch_size=n_batch, mode=self.mode, n_shards=self.n_shards)
         return batch
 
     def __len__(self):
