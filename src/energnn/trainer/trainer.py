@@ -104,6 +104,7 @@ class Trainer:
         # Cache JIT-compiled wrappers to avoid NNX re-tracing overhead each step.
         # `get_info` is static because downstream code branches on its concrete value.
         self._jit_apply = nnx.jit(self._apply_forward_vjp, static_argnames=("get_info",))
+        self._jit_backward = jax.jit(self._backward_from_vjp)
         self._jit_eval_forward = nnx.jit(self._eval_forward)
         self._jit_update_params = nnx.jit(_update_params_fn)
 
@@ -119,6 +120,21 @@ class Trainer:
 
         (jax_decision, rest_updated), vjp_fn = jax.vjp(f_forward, params, rest)
         return jax_decision, rest_updated, vjp_fn
+
+    @staticmethod
+    def _backward_from_vjp(vjp_fn, jax_gradient, jax_decision, rest_updated):
+        """Compiled backward pass, designed to be JIT-compiled once and reused.
+
+        Calling the ``vjp_fn`` returned by :meth:`_apply_forward_vjp` directly would
+        interpret the transposed computation op-by-op; ``vjp_fn`` is a pytree
+        (``jax.tree_util.Partial``) with a stable structure across steps, so passing it
+        through ``jax.jit`` compiles the whole backward pass once. The cotangent dtype
+        cast and the zero cotangents for the non-parameter state are folded in as well.
+        """
+        jax_cotangent = _cast_cotangent_to_primal_dtype(jax_gradient, jax_decision)
+        rest_cotangent = jax.tree.map(jnp.zeros_like, rest_updated)
+        (grads_params, _) = vjp_fn((jax_cotangent, rest_cotangent))
+        return grads_params
 
     @staticmethod
     def _eval_forward(model, context):
@@ -384,18 +400,11 @@ class Trainer:
             )
             _sync_and_log("get_gradient", t_start, jax_gradient)
 
+            # Backward pass (compiled; includes the cotangent dtype cast and the zero
+            # cotangents for the non-parameter state)
             t_start = time.perf_counter()
-            jax_cotangent = _cast_cotangent_to_primal_dtype(jax_gradient, jax_decision)
-            _sync_and_log("cast_cotangent", t_start, jax_cotangent)
-
-            # Backward pass
-            t_start = time.perf_counter()
-            rest_cotangent = jax.tree.map(jnp.zeros_like, rest_updated)
-            _sync_and_log("rest_cotangent", t_start, rest_cotangent)
-
-            t_start = time.perf_counter()
-            (grads_params, _) = vjp_fn((jax_cotangent, rest_cotangent))
-            _sync_and_log("vjp_fn", t_start, grads_params)
+            grads_params = self._jit_backward(vjp_fn, jax_gradient, jax_decision, rest_updated)
+            _sync_and_log("backward", t_start, grads_params)
 
             t_start = time.perf_counter()
             self._jit_update_params(self.optimizer, self.model, grads_params)
