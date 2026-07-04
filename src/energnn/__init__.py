@@ -5,5 +5,6 @@
 # SPDX-License-Identifier: MPL-2.0
 #
 from energnn import graph, model, problem, tracker, trainer
+from energnn.utils import enable_persistent_compilation_cache
 
-__all__ = ["graph", "model", "problem", "tracker", "trainer"]
+__all__ = ["graph", "model", "problem", "tracker", "trainer", "enable_persistent_compilation_cache"]
