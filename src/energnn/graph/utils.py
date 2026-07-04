@@ -10,7 +10,7 @@ import jax
 import numpy as np
 
 
-def to_numpy(a: dict | np.ndarray | jax.Array | tuple | None) -> dict | np.ndarray | None:
+def to_numpy(a: dict | np.ndarray | jax.Array | tuple | None, dtype: str | None = "float32") -> dict | np.ndarray | None:
     """
     Converts a NumPy array, JAX array, or tuple of values into a NumPy array (dtype float32),
     or converts the values in a dictionary accordingly.
@@ -22,6 +22,8 @@ def to_numpy(a: dict | np.ndarray | jax.Array | tuple | None) -> dict | np.ndarr
     - In all other cases, a TypeError is raised.
 
     :param a: A np.ndarray, jax.Array, tuple, dict, or None.
+    :param dtype: Target dtype for the converted arrays; None preserves the input dtype
+        (useful for integer data such as port addresses).
     :returns: Either None, a np.ndarray, or a dict with the same keys and converted np.ndarray values.
     :raises TypeError: If `a` is not of an expected or supported type.
     """
@@ -32,7 +34,9 @@ def to_numpy(a: dict | np.ndarray | jax.Array | tuple | None) -> dict | np.ndarr
     def _to_np(x: Any) -> Any:
         # On traite np.ndarray, jax.Array et tuple
         if isinstance(x, (np.ndarray, jax.Array, np.ndarray, tuple)):
-            return np.array(x, dtype=np.dtype("float32"))
+            if dtype is None:
+                return np.asarray(x)
+            return np.array(x, dtype=np.dtype(dtype))
         else:
             return x
 

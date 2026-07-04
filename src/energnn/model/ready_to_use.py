@@ -26,11 +26,18 @@ class ReadyRecurrentEquivariantGNN(GNN):
         hidden_sizes: list[int],
         n_steps: int = 5,
         seed: int = 0,
+        normalizer_update_period: int = 1,
+        remat: bool = False,
     ):
 
         rngs = nnx.Rngs(seed)
 
-        normalizer = TDigestNormalizer(in_structure=in_structure, n_breakpoints=n_breakpoints, update_limit=1000)
+        normalizer = TDigestNormalizer(
+            in_structure=in_structure,
+            n_breakpoints=n_breakpoints,
+            update_limit=1000,
+            update_period=normalizer_update_period,
+        )
 
         encoder = MLPEncoder(
             in_structure=in_structure,
@@ -69,6 +76,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             phi=phi,
             message_functions=[message_function],
             n_steps=n_steps,
+            remat=remat,
         )
 
         decoder = MLPEquivariantDecoder(
