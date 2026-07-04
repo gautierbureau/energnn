@@ -140,11 +140,12 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
                 input_array.append(gather(coordinates=coordinates, addresses=port_array))
             input_array = jnp.concatenate(input_array, axis=-1)
             non_fictitious_mask = jnp.expand_dims(hyper_edge_set.non_fictitious, -1)
+            masked_input_array = input_array * non_fictitious_mask
 
             def sum_over_ports(__accumulator: jax.Array, mlp_port: tuple[MLP, jax.Array]) -> jax.Array:
                 """Sums the outputs of port-specific MLPs through ports of a given hyper-edge set."""
                 mlp, _port_array = mlp_port
-                increment = mlp(input_array * non_fictitious_mask) * non_fictitious_mask
+                increment = mlp(masked_input_array) * non_fictitious_mask
                 return scatter_add(accumulator=__accumulator, increment=increment, addresses=_port_array)
 
             mlp_port_dict = {port_name: (mlp, hyper_edge_set.port_dict[port_name]) for port_name, mlp in mlp_dict.items()}
