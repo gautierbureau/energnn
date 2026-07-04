@@ -24,6 +24,12 @@ HYPER_EDGE_SETS = "hyper_edge_sets"
 TRUE_SHAPE = "true_shape"
 CURRENT_SHAPE = "current_shape"
 NON_FICTITIOUS_ADDRESSES = "non_fictitious_addresses"
+SEGMENTS = "segments"
+
+# Keys of the optional ``segments`` metadata carried by disjoint-union graphs.
+ADDRESS_GRAPH_IDS = "address_graph_ids"
+HYPER_EDGE_GRAPH_IDS = "hyper_edge_graph_ids"
+TRUE_SHAPES = "true_shapes"
 
 
 @register_pytree_node_class
@@ -39,6 +45,9 @@ class Graph(dict):
     :param true_shape: True shape, unaffected by padding.
     :param current_shape: Current shape, consistent with padding.
     :param non_fictitious_addresses: 1 for real addresses, 0 otherwise.
+    :param segments: Optional disjoint-union metadata created by :func:`union_graphs`
+        (per-address and per-hyper-edge instance ids plus per-instance true shapes).
+        ``None`` for regular single or batched graphs.
     """
 
     def __init__(
@@ -49,6 +58,7 @@ class Graph(dict):
         true_shape: GraphShape,
         current_shape: GraphShape,
         non_fictitious_addresses,
+        segments: dict | None = None,
     ) -> None:
         super().__init__()
         self._backend: Backend = backend if backend is not None else NumpyBackend()
@@ -56,6 +66,7 @@ class Graph(dict):
         self[TRUE_SHAPE] = true_shape
         self[CURRENT_SHAPE] = current_shape
         self[NON_FICTITIOUS_ADDRESSES] = non_fictitious_addresses
+        self[SEGMENTS] = segments
 
     # ------------------------------------------------------------------
     # JAX PyTree protocol
@@ -76,6 +87,7 @@ class Graph(dict):
             true_shape=d[TRUE_SHAPE],
             current_shape=d[CURRENT_SHAPE],
             non_fictitious_addresses=d[NON_FICTITIOUS_ADDRESSES],
+            segments=d.get(SEGMENTS),
         )
 
     # ------------------------------------------------------------------
@@ -123,12 +135,23 @@ class Graph(dict):
         true_shape_b = self.true_shape.to_backend(new_backend)
         current_shape_b = self.current_shape.to_backend(new_backend)
         nfa_b = new_backend.from_numpy(np.array(self.non_fictitious_addresses))
+        segments_b = None
+        if self.segments is not None:
+            segments_b = {
+                ADDRESS_GRAPH_IDS: new_backend.from_numpy(np.array(self.segments[ADDRESS_GRAPH_IDS]), dtype="int32"),
+                HYPER_EDGE_GRAPH_IDS: {
+                    k: new_backend.from_numpy(np.array(v), dtype="int32")
+                    for k, v in self.segments[HYPER_EDGE_GRAPH_IDS].items()
+                },
+                TRUE_SHAPES: self.segments[TRUE_SHAPES].to_backend(new_backend),
+            }
         return type(self)(
             backend=new_backend,
             hyper_edge_sets=hyper_edge_sets_b,
             true_shape=true_shape_b,
             current_shape=current_shape_b,
             non_fictitious_addresses=nfa_b,
+            segments=segments_b,
         )
 
     @classmethod
@@ -180,6 +203,25 @@ class Graph(dict):
     @non_fictitious_addresses.setter
     def non_fictitious_addresses(self, value) -> None:
         self[NON_FICTITIOUS_ADDRESSES] = value
+
+    @property
+    def segments(self) -> dict | None:
+        """Disjoint-union metadata (see :func:`union_graphs`); None for regular graphs."""
+        return self.get(SEGMENTS)
+
+    @segments.setter
+    def segments(self, value: dict | None) -> None:
+        self[SEGMENTS] = value
+
+    @property
+    def n_union_graphs(self) -> int:
+        """Number of instances in a disjoint-union graph (including padded empty instances).
+
+        :raises ValueError: If this graph carries no union segment metadata.
+        """
+        if self.segments is None:
+            raise ValueError("This graph is not a disjoint union (no segment metadata).")
+        return int(self.segments[TRUE_SHAPES].addresses.shape[0])
 
     @property
     def hyper_edge_sets(self) -> dict[str, HyperEdgeSet]:
@@ -456,6 +498,142 @@ def concatenate_graphs(graph_list: list[Graph]) -> Graph:
         true_shape=true_shape,
         current_shape=current_shape,
     )
+
+
+def union_graphs(graph_list: list[Graph], *, target_shape: GraphShape | None = None, n_graphs: int | None = None) -> Graph:
+    """
+    Combine single graphs into one disjoint-union graph with segment metadata.
+
+    Unlike :func:`collate_graphs` (which requires identical shapes and adds a batch
+    axis), the inputs are concatenated into a single larger graph with offset
+    addresses: compute then scales with the *sum* of instance sizes instead of
+    ``batch * max_size``. The returned graph carries a ``segments`` entry mapping
+    every address and hyper-edge back to its instance, so segment-aware decoders and
+    scores can produce per-instance outputs, and :func:`separate_union` can invert
+    the operation. Fictitious (padded) entries get the out-of-range id ``n_graphs``
+    so scatter-based segment reductions drop them.
+
+    :param graph_list: Non-empty list of single (non-batched, unpadded) graphs.
+    :param target_shape: Optional total-size budget to pad the union to. Using a small
+        set of budget buckets keeps compiled shapes stable across batches.
+    :param n_graphs: Number of instances the union represents; must be
+        >= ``len(graph_list)``. Extra instances are empty, allowing a fixed instance
+        count across batches. Defaults to ``len(graph_list)``.
+    :return: A single Graph with ``segments`` metadata.
+    """
+    if not graph_list:
+        raise ValueError("union_graphs requires at least one Graph.")
+    for g in graph_list:
+        if not g.is_single:
+            raise ValueError("union_graphs requires single (non-batched) graphs.")
+    n_real = len(graph_list)
+    if n_graphs is None:
+        n_graphs = n_real
+    if n_graphs < n_real:
+        raise ValueError(f"n_graphs ({n_graphs}) must be >= len(graph_list) ({n_real}).")
+
+    backend = graph_list[0]._backend
+    xp = backend.xp
+
+    # Per-instance true shapes, padded with empty instances up to n_graphs.
+    true_shapes = collate_shapes([g.true_shape for g in graph_list])
+    if n_graphs > n_real:
+        true_shapes = GraphShape(
+            backend=backend,
+            hyper_edge_sets={k: xp.pad(v, [(0, n_graphs - n_real)]) for k, v in true_shapes.hyper_edge_sets.items()},
+            addresses=xp.pad(true_shapes.addresses, [(0, n_graphs - n_real)]),
+        )
+
+    union = concatenate_graphs(graph_list)
+    if target_shape is not None:
+        union.pad(target_shape)
+
+    def _graph_ids(counts: list[int], total: int) -> np.ndarray:
+        ids = np.full(total, n_graphs, dtype=np.int32)
+        offset = 0
+        for i, count in enumerate(counts):
+            ids[offset : offset + count] = i
+            offset += count
+        return ids
+
+    address_counts = [len(g.non_fictitious_addresses) for g in graph_list]
+    address_ids = _graph_ids(address_counts, len(union.non_fictitious_addresses))
+    hyper_edge_ids = {
+        key: _graph_ids([g.hyper_edge_sets[key].n_obj for g in graph_list], union.hyper_edge_sets[key].n_obj)
+        for key in union.hyper_edge_sets
+    }
+
+    union.segments = {
+        ADDRESS_GRAPH_IDS: xp.array(address_ids),
+        HYPER_EDGE_GRAPH_IDS: {k: xp.array(v) for k, v in hyper_edge_ids.items()},
+        TRUE_SHAPES: true_shapes,
+    }
+    return union
+
+
+def separate_union(graph: Graph) -> list[Graph]:
+    """
+    Split a disjoint-union graph back into its instances (reverses :func:`union_graphs`).
+
+    Slices every hyper-edge set and the address mask by the per-instance true shapes
+    recorded in the segment metadata, restoring local addresses. Padded (fictitious)
+    entries and padded empty instances are dropped.
+
+    :param graph: A Graph produced by :func:`union_graphs` (or derived from one, e.g.
+        a decoded output that carries the same segment metadata).
+    :return: List of single Graph instances, in the original order.
+    """
+    if graph.segments is None:
+        raise ValueError("Graph carries no union segment metadata, impossible to separate.")
+    backend = graph._backend
+    xp = backend.xp
+
+    shape_list = separate_shapes(graph.segments[TRUE_SHAPES])
+    has_addresses = len(graph.non_fictitious_addresses) > 0
+
+    class_counts = {k: [int(s.hyper_edge_sets[k]) for s in shape_list] for k in graph.hyper_edge_sets}
+    class_offsets = {k: np.concatenate([[0], np.cumsum(v)]) for k, v in class_counts.items()}
+    address_counts = [int(s.addresses) for s in shape_list]
+    address_offsets = np.concatenate([[0], np.cumsum(address_counts)])
+
+    graphs = []
+    for i, shape in enumerate(shape_list):
+        hes_dict = {}
+        for key, hes in graph.hyper_edge_sets.items():
+            start, count = int(class_offsets[key][i]), class_counts[key][i]
+            port_dict = (
+                {k: v[start : start + count] - xp.asarray(address_offsets[i], dtype=v.dtype) for k, v in hes.port_dict.items()}
+                if hes.port_dict is not None
+                else None
+            )
+            hes_dict[key] = HyperEdgeSet(
+                backend=backend,
+                port_dict=port_dict,
+                feature_array=hes.feature_array[start : start + count] if hes.feature_array is not None else None,
+                feature_names=hes.feature_names,
+                non_fictitious=hes.non_fictitious[start : start + count],
+            )
+        if has_addresses:
+            nfa = graph.non_fictitious_addresses[int(address_offsets[i]) : int(address_offsets[i]) + address_counts[i]]
+            addresses = shape.addresses
+        else:
+            nfa = xp.zeros([0])
+            addresses = xp.array(0)
+        true_shape = GraphShape(
+            backend=backend,
+            hyper_edge_sets={k: shape.hyper_edge_sets[k] for k in graph.hyper_edge_sets},
+            addresses=addresses,
+        )
+        graphs.append(
+            type(graph)(
+                backend=backend,
+                hyper_edge_sets=hes_dict,
+                true_shape=true_shape,
+                current_shape=true_shape,
+                non_fictitious_addresses=nfa,
+            )
+        )
+    return graphs
 
 
 # ---------------------------------------------------------------------------

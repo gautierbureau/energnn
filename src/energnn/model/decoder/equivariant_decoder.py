@@ -186,6 +186,7 @@ class MLPEquivariantDecoder(EquivariantDecoder):
             non_fictitious_addresses=jnp.array([]),
             true_shape=true_shape,
             current_shape=current_shape,
+            segments=graph.segments,
         )
 
         return output_graph, {}
