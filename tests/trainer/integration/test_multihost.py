@@ -27,21 +27,26 @@ import numpy as np, optax
 from flax import nnx
 from jax.sharding import Mesh
 from energnn.problem.example import LinearSystemProblemLoader
-from energnn.model.ready_to_use import TinyRecurrentEquivariantGNN
+from energnn.model.ready_to_use import ReadyRecurrentEquivariantGNN
 from energnn.trainer import Trainer
 
 assert jax.process_count() == 2 and jax.device_count() == 4 and jax.local_device_count() == 2
 mesh = Mesh(np.array(jax.devices()), ("data",))
 # Keep the workload tiny: one batch per epoch (dataset_size == batch_size) with a
 # fixed n_max so all batches share one padded shape -> a single SPMD compilation.
-common = dict(dataset_size=8, batch_size=8, n_max=6, mode="union", n_shards=4,
+common = dict(dataset_size=4, batch_size=4, n_max=4, mode="union", n_shards=4,
               process_count=2, process_index=jax.process_index(), mesh=mesh)
 tl = LinearSystemProblemLoader(seed=1, **common)
 vl = LinearSystemProblemLoader(seed=2, **common)
-model = TinyRecurrentEquivariantGNN(in_structure=tl.context_structure, out_structure=tl.decision_structure)
+# Multi-host requires a callback-free forward, so the normalizer updates on the host.
+model = ReadyRecurrentEquivariantGNN(
+    in_structure=tl.context_structure, out_structure=tl.decision_structure,
+    n_breakpoints=10, latent_dimension=4, hidden_sizes=[], n_steps=5,
+    normalizer_external_updates=True,
+)
 trainer = Trainer(model=model, gradient_transformation=optax.adam(1e-2), mesh=mesh)
 score_before, _ = trainer.eval(vl, get_info=False)
-trainer.train(train_loader=tl, n_epochs=4, progress_bar=False)
+trainer.train(train_loader=tl, n_epochs=3, progress_bar=False)
 score_after, _ = trainer.eval(vl, get_info=False)
 # Parameters and the evaluation score are globally reduced, so every process agrees.
 param_sum = float(np.asarray(jax.tree.leaves(nnx.state(model, nnx.Param))[0]).sum())
@@ -73,6 +78,29 @@ def test_process_partitioning_reconstructs_global_batch():
             np.array(actual.hyper_edge_sets["bus"].feature_array),
             rtol=1e-6,
         )
+
+
+def test_host_callback_normalizer_guard():
+    """A host-callback normalizer (default T-Digest) is rejected for genuine multi-host meshes."""
+    from energnn.model.ready_to_use import ReadyRecurrentEquivariantGNN, TinyRecurrentEquivariantGNN
+    from energnn.problem.example import LinearSystemProblemLoader
+    from energnn.trainer.trainer import _check_no_host_callbacks
+
+    loader = LinearSystemProblemLoader(seed=0)
+    default_model = TinyRecurrentEquivariantGNN(in_structure=loader.context_structure, out_structure=loader.decision_structure)
+    with pytest.raises(ValueError, match="external_updates"):
+        _check_no_host_callbacks(default_model)
+
+    external_model = ReadyRecurrentEquivariantGNN(
+        in_structure=loader.context_structure,
+        out_structure=loader.decision_structure,
+        n_breakpoints=10,
+        latent_dimension=4,
+        hidden_sizes=[],
+        n_steps=5,
+        normalizer_external_updates=True,
+    )
+    _check_no_host_callbacks(external_model)  # must not raise
 
 
 def test_generator_rejects_bad_process_layout():

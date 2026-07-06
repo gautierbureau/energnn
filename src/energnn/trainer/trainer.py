@@ -66,6 +66,22 @@ def _functional_update(opt_graphdef, opt_state, model_graphdef, params, rest, gr
     return new_params, new_opt_state
 
 
+def _check_no_host_callbacks(model: GNN) -> None:
+    """Raise if the model's normalizer would embed a host callback in the forward pass.
+
+    Host callbacks (e.g. the T-Digest ``io_callback``) deadlock inside a multi-host SPMD
+    program. Such normalizers must run their statistics updates on the host instead
+    (``external_updates=True``), which keeps the compiled forward callback-free.
+    """
+    normalizer = getattr(model, "normalizer", None)
+    if getattr(normalizer, "external_updates", True) is False:
+        raise ValueError(
+            "Multi-host training requires a normalizer whose forward pass has no host "
+            "callbacks. Construct the model with normalizer_external_updates=True (or set "
+            "the normalizer's external_updates=True) so T-Digest ingestion runs on the host."
+        )
+
+
 def _setup_ckpt_mngr(checkpoint_manager: CheckpointManager, optim_mode: Literal["minimize", "maximize"]):
     checkpoint_manager._options.best_fn = lambda x: x["score"]
     if optim_mode == "minimize":
@@ -128,6 +144,8 @@ class Trainer:
         if mesh is not None:
             if len(mesh.axis_names) != 1:
                 raise ValueError(f"Trainer expects a 1-D data-parallel mesh, got axes {mesh.axis_names}.")
+            if mesh.size > jax.local_device_count():
+                _check_no_host_callbacks(model)
             self._data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(mesh.axis_names[0]))
             # Replicate parameters and optimizer state as global arrays on the mesh, so
             # they are compatible with the globally-sharded context input under jit.
@@ -442,6 +460,11 @@ class Trainer:
             ingest = getattr(self.model, "ingest", None)
             if ingest is not None:
                 ingest(graph=jax_context)
+                # ingest writes process-local normalizer state (counters, digest grids);
+                # re-replicate it as global arrays so the next jitted forward stays
+                # consistent with the sharded context. No-op without a mesh.
+                if self.mesh is not None:
+                    nnx.update(self.model.normalizer, replicate(nnx.state(self.model.normalizer), self.mesh))
             _sync_and_log("ingest", t_start)
 
             t_start = time.perf_counter()

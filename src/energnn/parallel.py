@@ -63,10 +63,24 @@ def replicate(pytree, mesh: jax.sharding.Mesh):
     sharding = replicated_sharding(mesh)
 
     def _replicate_leaf(x):
-        local = np.asarray(x)
+        local = local_replica(x)
         return jax.make_array_from_process_local_data(sharding, local, local.shape)
 
     return jax.tree.map(_replicate_leaf, pytree)
+
+
+def local_replica(array) -> np.ndarray:
+    """
+    Read a replicated array's value from this process's local replica, as a host NumPy array.
+
+    A replicated global array holds the same data on every device but still *spans* all
+    processes' devices, so it is not "fully addressable" and ``np.asarray`` on it raises in
+    a multi-process run. Reading an addressable shard returns the full (replicated) value.
+    On a single process this is just ``np.asarray``.
+    """
+    if jax.process_count() > 1 and hasattr(array, "addressable_data") and not array.is_fully_addressable:
+        return np.asarray(array.addressable_data(0))
+    return np.asarray(array)
 
 
 def gather_to_host(array) -> np.ndarray:
