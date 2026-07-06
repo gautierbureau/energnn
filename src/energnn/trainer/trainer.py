@@ -22,6 +22,7 @@ from tqdm import tqdm
 
 from energnn.graph import Graph
 from energnn.model import GNN
+from energnn.parallel import replicate
 from energnn.problem import ProblemBatch, ProblemLoader
 from energnn.tracker import Tracker
 from .utils import TaskLogger
@@ -63,6 +64,22 @@ def _functional_update(opt_graphdef, opt_state, model_graphdef, params, rest, gr
     _, new_params, _ = nnx.split(model, nnx.Param, ...)
     _, new_opt_state = nnx.split(optimizer)
     return new_params, new_opt_state
+
+
+def _check_no_host_callbacks(model: GNN) -> None:
+    """Raise if the model's normalizer would embed a host callback in the forward pass.
+
+    Host callbacks (e.g. the T-Digest ``io_callback``) deadlock inside a multi-host SPMD
+    program. Such normalizers must run their statistics updates on the host instead
+    (``external_updates=True``), which keeps the compiled forward callback-free.
+    """
+    normalizer = getattr(model, "normalizer", None)
+    if getattr(normalizer, "external_updates", True) is False:
+        raise ValueError(
+            "Multi-host training requires a normalizer whose forward pass has no host "
+            "callbacks. Construct the model with normalizer_external_updates=True (or set "
+            "the normalizer's external_updates=True) so T-Digest ingestion runs on the host."
+        )
 
 
 def _setup_ckpt_mngr(checkpoint_manager: CheckpointManager, optim_mode: Literal["minimize", "maximize"]):
@@ -127,7 +144,15 @@ class Trainer:
         if mesh is not None:
             if len(mesh.axis_names) != 1:
                 raise ValueError(f"Trainer expects a 1-D data-parallel mesh, got axes {mesh.axis_names}.")
+            if mesh.size > jax.local_device_count():
+                _check_no_host_callbacks(model)
             self._data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(mesh.axis_names[0]))
+            # Replicate parameters and optimizer state as global arrays on the mesh, so
+            # they are compatible with the globally-sharded context input under jit.
+            # On a single host this replicates across local devices (what GSPMD does
+            # implicitly), so results are unchanged; on multiple hosts it makes the
+            # otherwise process-local parameters into global replicated arrays.
+            self._replicate_state()
         else:
             self._data_sharding = None
 
@@ -139,6 +164,11 @@ class Trainer:
         # Parameter and optimizer-state buffers are donated so XLA can update them
         # in place instead of allocating fresh buffers.
         self._jit_update_params = nnx.jit(_functional_update, donate_argnums=(1, 3))
+
+    def _replicate_state(self) -> None:
+        """Place model and optimizer state as fully-replicated global arrays on the mesh."""
+        nnx.update(self.model, replicate(nnx.state(self.model), self.mesh))
+        nnx.update(self.optimizer, replicate(nnx.state(self.optimizer), self.mesh))
 
     @staticmethod
     def _apply_forward_vjp(graphdef, params, rest, jax_context, get_info):
@@ -430,6 +460,11 @@ class Trainer:
             ingest = getattr(self.model, "ingest", None)
             if ingest is not None:
                 ingest(graph=jax_context)
+                # ingest writes process-local normalizer state (counters, digest grids);
+                # re-replicate it as global arrays so the next jitted forward stays
+                # consistent with the sharded context. No-op without a mesh.
+                if self.mesh is not None:
+                    nnx.update(self.model.normalizer, replicate(nnx.state(self.model.normalizer), self.mesh))
             _sync_and_log("ingest", t_start)
 
             t_start = time.perf_counter()

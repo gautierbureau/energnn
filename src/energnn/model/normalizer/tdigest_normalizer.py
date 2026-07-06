@@ -16,6 +16,7 @@ from jax import ShapeDtypeStruct
 from jax.experimental import io_callback
 
 from energnn.graph import Graph, GraphStructure, HyperEdgeSet
+from energnn.parallel import gather_to_host, local_replica
 from .normalizer import Normalizer
 
 
@@ -393,22 +394,26 @@ class TDigestModule(nnx.Module):
         """
         if self.use_running_average:
             return
-        calls = int(self.calls[0])
-        updates = int(self.updates[0])
+        calls = int(local_replica(self.calls[...])[0])
+        updates = int(local_replica(self.updates[...])[0])
         self.calls[...] = self.calls[...] + 1
         if updates >= self.update_limit or calls % self.update_period != 0:
             return
 
+        # The feature array and mask may be sharded across processes (multi-host data
+        # parallelism); gather them so every process ingests the identical full batch and
+        # the replicated digest state stays consistent. On a single process this is a
+        # plain host copy. The digest state variables are replicated, hence addressable.
         new_vars = _ingest_new_data(
-            np.asarray(self.max_centroids_var[...]),
-            np.asarray(self.min_var[...]),
-            np.asarray(self.max_var[...]),
-            np.asarray(self.centroids_m_var[...]),
-            np.asarray(self.centroids_c_var[...]),
-            np.asarray(self.fp_var[...]),
-            np.asarray(self.xp_var[...]),
-            np.asarray(array, dtype=np.float32),
-            np.asarray(non_fictitious, dtype=np.float32),
+            local_replica(self.max_centroids_var[...]),
+            local_replica(self.min_var[...]),
+            local_replica(self.max_var[...]),
+            local_replica(self.centroids_m_var[...]),
+            local_replica(self.centroids_c_var[...]),
+            local_replica(self.fp_var[...]),
+            local_replica(self.xp_var[...]),
+            gather_to_host(array).astype(np.float32),
+            gather_to_host(non_fictitious).astype(np.float32),
         )
         self.max_centroids_var[...] = jnp.asarray(new_vars[0])
         self.min_var[...] = jnp.asarray(new_vars[1])

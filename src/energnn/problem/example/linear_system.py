@@ -11,6 +11,7 @@ from omegaconf import DictConfig
 
 from energnn.graph import GraphStructure, HyperEdgeSetStructure
 from energnn.graph import HYPER_EDGE_GRAPH_IDS, TRUE_SHAPES, Graph, GraphShape, HyperEdgeSet, collate_graphs, union_graphs
+from energnn.parallel import assemble_global, data_sharding, gather_to_host
 from ..batch import ProblemBatch
 from ..loader import ProblemLoader
 from ..problem import Problem
@@ -109,12 +110,14 @@ class LinearSystemProblemBatch(ProblemBatch):
 
             if true_addresses.ndim == 2:
                 # Batched unions (one per device shard): instances were packed
-                # contiguously, so flattening restores the original order; padded empty
-                # instance slots (zero addresses) are dropped by the mask.
-                objective = jax.vmap(union_scores)(features, oracle_features, masks, ids).reshape(-1)
-                objective = objective[jnp.reshape(true_addresses > 0, -1)]
+                # contiguously, so flattening restores the original order. The scores are
+                # sharded across processes, so gather them to the host (a no-op on a
+                # single process) before dropping the padded empty instance slots.
+                per_slot = jax.vmap(union_scores)(features, oracle_features, masks, ids).reshape(-1)
+                valid = jnp.reshape(true_addresses > 0, -1)
+                objective = gather_to_host(per_slot)[gather_to_host(valid)]
             else:
-                objective = union_scores(features, oracle_features, masks, ids)
+                objective = gather_to_host(union_scores(features, oracle_features, masks, ids))
             return objective.tolist(), {}
 
         gradient = _tree_copy(decision)
@@ -262,10 +265,18 @@ class LinearSystemProblemGenerator:
         context, oracle = self._generate_numpy_problem()
         return LinearSystemProblem(context=Graph.to_jax_backend(context), oracle=Graph.to_jax_backend(oracle))
 
-    def generate_problem_batch(self, batch_size: int = 8, mode: str = "dense", n_shards: int = 1) -> LinearSystemProblemBatch:
+    def generate_problem_batch(
+        self,
+        batch_size: int = 8,
+        mode: str = "dense",
+        n_shards: int = 1,
+        process_count: int = 1,
+        process_index: int = 0,
+        mesh: "jax.sharding.Mesh | None" = None,
+    ) -> LinearSystemProblemBatch:
         """Generate a batch of problems.
 
-        :param batch_size: Number of problem instances in the batch.
+        :param batch_size: Number of problem instances in the (global) batch.
         :param mode: ``"dense"`` pads every instance to the maximum shape and stacks them
             along a batch axis (processed with vmap). ``"union"`` concatenates the
             unpadded instances into one disjoint-union graph padded to a power-of-two
@@ -275,7 +286,23 @@ class LinearSystemProblemGenerator:
             axis — one union per device for data-parallel training (shard the batch
             with the trainer's ``mesh``). Ports never cross instances, so message
             passing needs no cross-device communication.
+        :param process_count: Number of processes (hosts) in a multi-host run. Each
+            process deterministically generates the same global batch and keeps only its
+            ``n_shards / process_count`` shards, so budgets stay identical across
+            processes with no communication. Union mode only.
+        :param process_index: Index of this process in ``[0, process_count)``.
+        :param mesh: Global device mesh. When provided, the process-local shards are
+            assembled into globally-sharded arrays (one union per device). Required for
+            ``process_count > 1``; on a single process it is equivalent to placing the
+            batch with ``jax.device_put``.
         """
+        if process_count < 1 or not (0 <= process_index < process_count):
+            raise ValueError(f"Invalid process layout: process_count={process_count}, process_index={process_index}.")
+        if process_count > 1 and mode != "union":
+            raise ValueError("process_count > 1 requires mode='union'.")
+        if process_count > 1 and n_shards % process_count != 0:
+            raise ValueError(f"n_shards ({n_shards}) must be divisible by process_count ({process_count}).")
+
         context_list, oracle_list = [], []
 
         for _ in range(batch_size):
@@ -284,8 +311,8 @@ class LinearSystemProblemGenerator:
             oracle_list.append(oracle)
 
         if mode == "dense":
-            if n_shards != 1:
-                raise ValueError("n_shards > 1 requires mode='union'.")
+            if n_shards != 1 or process_count != 1:
+                raise ValueError("dense mode does not support sharding (use mode='union').")
             max_context_shape = GraphShape(
                 hyper_edge_sets={
                     "line": np.array(self.n_max * (self.n_max - 1) // 2),
@@ -317,7 +344,8 @@ class LinearSystemProblemGenerator:
 
             # Bucket the union budgets to powers of two over the largest shard, so
             # training compiles a handful of shape variants instead of one per batch,
-            # and all shards share one padded shape (required to collate them).
+            # and all shards share one padded shape (required to collate them). The
+            # budget spans every shard, so all processes derive the same shapes.
             def _budget(chunks, count):
                 return _next_power_of_two(max(count(chunk) for chunk in chunks))
 
@@ -330,15 +358,27 @@ class LinearSystemProblemGenerator:
             )
             oracle_shape = GraphShape(hyper_edge_sets={"bus": np.array(bus_budget)}, addresses=np.array(address_budget))
 
-            context_unions = [union_graphs(chunk, target_shape=context_shape, n_graphs=capacity) for chunk in context_chunks]
-            oracle_unions = [union_graphs(chunk, target_shape=oracle_shape, n_graphs=capacity) for chunk in oracle_chunks]
+            # Keep only the shards owned by this process (all shards when single-process).
+            shards_per_process = n_shards // process_count
+            shard_slice = slice(process_index * shards_per_process, (process_index + 1) * shards_per_process)
+            local_context_chunks = context_chunks[shard_slice]
+            local_oracle_chunks = oracle_chunks[shard_slice]
 
-            if n_shards == 1:
-                context_batch = Graph.to_jax_backend(context_unions[0])
-                oracle_batch = Graph.to_jax_backend(oracle_unions[0])
+            context_unions = [union_graphs(c, target_shape=context_shape, n_graphs=capacity) for c in local_context_chunks]
+            oracle_unions = [union_graphs(c, target_shape=oracle_shape, n_graphs=capacity) for c in local_oracle_chunks]
+
+            local_context = context_unions[0] if len(context_unions) == 1 else collate_graphs(context_unions)
+            local_oracle = oracle_unions[0] if len(oracle_unions) == 1 else collate_graphs(oracle_unions)
+
+            if mesh is not None and (process_count > 1 or n_shards > 1):
+                # Assemble the process-local shards into globally-sharded arrays
+                # (convert to the JAX backend first so the assembled graph keeps it).
+                sharding = data_sharding(mesh)
+                context_batch = assemble_global(Graph.to_jax_backend(local_context), sharding)
+                oracle_batch = assemble_global(Graph.to_jax_backend(local_oracle), sharding)
             else:
-                context_batch = Graph.to_jax_backend(collate_graphs(context_unions))
-                oracle_batch = Graph.to_jax_backend(collate_graphs(oracle_unions))
+                context_batch = Graph.to_jax_backend(local_context)
+                oracle_batch = Graph.to_jax_backend(local_oracle)
         else:
             raise ValueError(f"Unknown batching mode: {mode!r}, expected 'dense' or 'union'.")
 
@@ -357,11 +397,16 @@ class LinearSystemProblemLoader(ProblemLoader):
         shuffle: bool = False,
         mode: str = "dense",
         n_shards: int = 1,
+        process_count: int = 1,
+        process_index: int = 0,
+        mesh: "jax.sharding.Mesh | None" = None,
     ):
         if mode not in ("dense", "union"):
             raise ValueError(f"Unknown batching mode: {mode!r}, expected 'dense' or 'union'.")
         if n_shards != 1 and mode != "union":
             raise ValueError("n_shards > 1 requires mode='union'.")
+        if process_count > 1 and mesh is None:
+            raise ValueError("Multi-host loading (process_count > 1) requires a device mesh.")
         self.seed = seed
         self.dataset_size = dataset_size
         self.batch_size = batch_size
@@ -369,6 +414,9 @@ class LinearSystemProblemLoader(ProblemLoader):
         self.shuffle = shuffle
         self.mode = mode
         self.n_shards = n_shards
+        self.process_count = process_count
+        self.process_index = process_index
+        self.mesh = mesh
         self.len = dataset_size
         self.current_step = 0
 
@@ -394,7 +442,14 @@ class LinearSystemProblemLoader(ProblemLoader):
         batch_end = min(self.current_step + self.batch_size, self.len)
         self.current_step = batch_end
         n_batch = batch_end - batch_start
-        batch = self.generator.generate_problem_batch(batch_size=n_batch, mode=self.mode, n_shards=self.n_shards)
+        batch = self.generator.generate_problem_batch(
+            batch_size=n_batch,
+            mode=self.mode,
+            n_shards=self.n_shards,
+            process_count=self.process_count,
+            process_index=self.process_index,
+            mesh=self.mesh,
+        )
         return batch
 
     def __len__(self):
