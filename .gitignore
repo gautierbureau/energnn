@@ -13,3 +13,4 @@
 # Doc
 /docs/_build
 /docs/**/_autosummary/
+tests/trainer/integration/_multihost_worker_tmp.py
