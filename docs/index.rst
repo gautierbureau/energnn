@@ -87,7 +87,6 @@ User guides
     basics
     tutorial_notebook
     custom_use_case
-    parallelism
     glossary
 
 -------------
