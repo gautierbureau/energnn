@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 from flax.nnx import initializers
-from flax.typing import Initializer
+from flax.typing import Dtype, Initializer
 
 from energnn.graph import GraphStructure, Graph
 from energnn.model.utils import Activation, MLP, gather, scatter_add
@@ -23,6 +23,66 @@ class MessagePassingFunction(nnx.Module, ABC):
     def __call__(self, graph: Graph, coordinates: jax.Array, get_info: bool = False) -> tuple[jax.Array, dict]:
         """Should take as input a tuple (graph, coordinates) and return new coordinates."""
         raise NotImplementedError
+
+
+def _can_fuse_mlps(mlps: list) -> bool:
+    """True if all modules are standard MLPs with identical architecture.
+
+    Such MLPs can be applied to the same input as a single batched pass over their
+    stacked weights, instead of one chain of small matmuls per port.
+    """
+    if len(mlps) < 2:
+        return False
+    if not all(type(m) is MLP for m in mlps):
+        return False
+    first = mlps[0]
+    return all(
+        m.in_size == first.in_size
+        and m.hidden_sizes == first.hidden_sizes
+        and m.out_size == first.out_size
+        and m.use_bias == first.use_bias
+        and m.activation is first.activation
+        and m.final_activation is first.final_activation
+        and m.dtype == first.dtype
+        for m in mlps[1:]
+    )
+
+
+def _fused_mlp_apply(mlps: list[MLP], x: jax.Array, dtype=None) -> jax.Array:
+    """Apply identically-shaped MLPs to the same input in one batched pass.
+
+    Stacks the per-MLP layer weights along a leading axis and contracts each layer
+    with a single einsum, so ``len(mlps)`` port-specific MLPs cost one batched matmul
+    per layer instead of one small matmul each. When ``dtype`` is set the matmuls run
+    in that dtype (mirroring ``nnx.Linear(dtype=...)``), so the fused path composes with
+    bf16 mixed precision.
+
+    :param mlps: MLPs with identical architecture (see :func:`_can_fuse_mlps`).
+    :param x: Common input array of shape ``(..., in_size)``.
+    :param dtype: Compute dtype for the matmuls, or None for full precision.
+    :return: Stacked outputs of shape ``(len(mlps), ..., out_size)``.
+    """
+    y = x
+    first_linear = True
+    for i, layer in enumerate(mlps[0].sequential.layers):
+        if isinstance(layer, nnx.Linear):
+            kernel = jnp.stack([m.sequential.layers[i].kernel[...] for m in mlps])
+            if dtype is not None:
+                y = y.astype(dtype)
+                kernel = kernel.astype(dtype)
+            if first_linear:
+                y = jnp.einsum("...f,pfo->p...o", y, kernel)
+                first_linear = False
+            else:
+                y = jnp.einsum("p...f,pfo->p...o", y, kernel)
+            if layer.bias is not None:
+                bias = jnp.stack([m.sequential.layers[i].bias[...] for m in mlps])
+                if dtype is not None:
+                    bias = bias.astype(dtype)
+                y = y + bias.reshape(bias.shape[0], *([1] * (y.ndim - 2)), bias.shape[1])
+        else:
+            y = layer(y)
+    return y
 
 
 class LocalSumMessagePassingFunction(MessagePassingFunction):
@@ -54,6 +114,14 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
     :param outer_activation: Activation function :math:`\sigma` applied over the output.
     :param encoded_feature_size: None if the input data has not been encoded, otherwise the size of the encoded features.
     :param port_scatter_blacklist: Dictionary mapping hyper-edge set keys to lists of port keys to be excluded from the sum.
+    :param dtype: Computation dtype of the MLPs :math:`\xi^{c,o}_\theta` (e.g. ``jnp.bfloat16``
+        for mixed precision); parameters stay float32 and the scatter accumulation runs in
+        float32. None (default) computes in full precision.
+    :param fuse_port_mlps: If True, apply a class's port MLPs (identical architecture) as a
+        single batched einsum over their stacked weights instead of one small matmul per
+        port. Numerically equivalent; a throughput trade-off that tends to help on GPU
+        (batched GEMM, fewer kernel launches) and hurt on CPU. Default False. Modules that
+        are not standard MLPs fall back to the per-port path.
     :param seed: Seed for RNG streams for weight initialization.
     """
 
@@ -71,6 +139,8 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
         outer_activation: Activation = nnx.tanh,
         encoded_feature_size: int | None = None,
         port_scatter_blacklist: dict[str, list[str]] | None = None,
+        dtype: Dtype | None = None,
+        fuse_port_mlps: bool = False,
         seed: int | None = None,
         rngs: nnx.Rngs | None = None,
     ):
@@ -85,6 +155,8 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
         self.final_activation = final_activation
         self.outer_activation = outer_activation
         self.encoded_feature_size = encoded_feature_size
+        self.dtype = dtype
+        self.fuse_port_mlps = fuse_port_mlps
         if port_scatter_blacklist is None:
             self.port_scatter_blacklist = {}
         else:
@@ -123,15 +195,19 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
                             kernel_init=self.kernel_init,
                             bias_init=self.bias_init,
                             final_activation=self.final_activation,
+                            dtype=self.dtype,
                             rngs=rngs,
                         )
         return nnx.data(mlp_tree)
 
     def __call__(self, *, graph: Graph, coordinates: jax.Array, get_info: bool = False) -> tuple[jax.Array, dict]:
 
-        def sum_over_edges(_accumulator, edge_mlp_tuple):
-            """Sums the output of class and port specific MLPs through ports of all hyper-edge sets in the graph."""
-            hyper_edge_set, mlp_dict = edge_mlp_tuple
+        accumulator = jnp.zeros((coordinates.shape[0], self.out_size))
+
+        # Iterate classes and ports in sorted key order (a stable, backend-independent order).
+        for key in sorted(graph.hyper_edge_sets.keys()):
+            hyper_edge_set = graph.hyper_edge_sets[key]
+            mlp_dict = self.mlp_tree[key]
 
             input_array = []
             if hyper_edge_set.feature_names is not None:
@@ -142,25 +218,23 @@ class LocalSumMessagePassingFunction(MessagePassingFunction):
             non_fictitious_mask = jnp.expand_dims(hyper_edge_set.non_fictitious, -1)
             masked_input_array = input_array * non_fictitious_mask
 
-            def sum_over_ports(__accumulator: jax.Array, mlp_port: tuple[MLP, jax.Array]) -> jax.Array:
-                """Sums the outputs of port-specific MLPs through ports of a given hyper-edge set."""
-                mlp, _port_array = mlp_port
-                increment = mlp(masked_input_array) * non_fictitious_mask
-                return scatter_add(accumulator=__accumulator, increment=increment, addresses=_port_array)
+            port_items = sorted(mlp_dict.items(), key=lambda kv: kv[0])
+            mlps = [mlp for _, mlp in port_items]
 
-            mlp_port_dict = {port_name: (mlp, hyper_edge_set.port_dict[port_name]) for port_name, mlp in mlp_dict.items()}
-            return jax.tree.reduce(
-                sum_over_ports, mlp_port_dict, initializer=_accumulator, is_leaf=lambda x: isinstance(x, tuple)
-            )
-
-        initializer = jnp.zeros((coordinates.shape[0], self.out_size))
-        edge_mlp_dict = {key: (hyper_edge_set, self.mlp_tree[key]) for key, hyper_edge_set in graph.hyper_edge_sets.items()}
-        accumulator = jax.tree.reduce(
-            sum_over_edges,
-            edge_mlp_dict,
-            initializer=initializer,
-            is_leaf=lambda x: isinstance(x, tuple),
-        )
+            if self.fuse_port_mlps and _can_fuse_mlps(mlps):
+                # All port MLPs share one architecture: run them as one batched pass.
+                outputs = _fused_mlp_apply(mlps, masked_input_array, dtype=self.dtype)
+                for (port_name, _), output in zip(port_items, outputs):
+                    increment = output * non_fictitious_mask
+                    accumulator = scatter_add(
+                        accumulator=accumulator, increment=increment, addresses=hyper_edge_set.port_dict[port_name]
+                    )
+            else:
+                for port_name, mlp in port_items:
+                    increment = mlp(masked_input_array) * non_fictitious_mask
+                    accumulator = scatter_add(
+                        accumulator=accumulator, increment=increment, addresses=hyper_edge_set.port_dict[port_name]
+                    )
 
         return self.outer_activation(accumulator), {}
 

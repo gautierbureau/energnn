@@ -4,6 +4,7 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 # SPDX-License-Identifier: MPL-2.0
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -76,15 +77,18 @@ def test_invariant_decoder_segment_sums():
     coordinates = jnp.array(
         np.random.default_rng(0).normal(size=(union.non_fictitious_addresses.shape[0], 4)), dtype=jnp.float32
     )
-    out, _ = decoder(graph=union, coordinates=coordinates)
-    assert out.shape == (3, 2)
+    # This asserts the segment-sum logic, not matmul precision: force full float32
+    # matmuls so it also passes on GPUs where float32 defaults to TF32 (~1e-4 error).
+    with jax.default_matmul_precision("highest"):
+        out, _ = decoder(graph=union, coordinates=coordinates)
+        assert out.shape == (3, 2)
 
-    address_sizes = [int(s) for s in np.array(union.segments["true_shapes"].addresses)]
-    offset = 0
-    for i, size in enumerate(address_sizes):
-        reference = phi(jnp.sum(psi(coordinates[offset : offset + size]), axis=0))
-        np.testing.assert_allclose(np.array(out[i]), np.array(reference), rtol=2e-5, atol=1e-6)
-        offset += size
+        address_sizes = [int(s) for s in np.array(union.segments["true_shapes"].addresses)]
+        offset = 0
+        for i, size in enumerate(address_sizes):
+            reference = phi(jnp.sum(psi(coordinates[offset : offset + size]), axis=0))
+            np.testing.assert_allclose(np.array(out[i]), np.array(reference), rtol=2e-5, atol=1e-6)
+            offset += size
 
 
 def test_union_training_converges():
