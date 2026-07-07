@@ -31,6 +31,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
         normalizer_external_updates: bool = False,
         remat: bool = False,
         compute_dtype: str | None = None,
+        fuse_port_mlps: bool = False,
     ):
 
         rngs = nnx.Rngs(seed)
@@ -69,6 +70,7 @@ class ReadyRecurrentEquivariantGNN(GNN):
             outer_activation=nnx.tanh,
             encoded_feature_size=latent_dimension,
             dtype=dtype,
+            fuse_port_mlps=fuse_port_mlps,
             rngs=rngs,
         )
 
