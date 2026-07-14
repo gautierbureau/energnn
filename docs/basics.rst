@@ -54,6 +54,28 @@ This leads to the following **Amortized Optimization** [Amos2022]_ problem:
 **EnerGNN** handles steps (2) and (4), which are independent of the use case, while
 steps (1) and (3) are use case specific and should respect the provided :mod:`energnn.problem` interface.
 
+The figure below summarizes how these pieces fit together.
+The **amortizer** (the reusable part handled by EnerGNN) turns a context :math:`x` into a decision :math:`y`,
+while each problem instance, drawn from a dataset, provides the context and feeds back the gradient
+:math:`\nabla_y f(y;x)` (in red) used to update the weights :math:`\theta`.
+
+.. image:: _static/energnn-pipeline-black.png
+    :class: only-light
+    :align: center
+    :width: 90%
+    :alt: The amortized optimization loop: a context flows through the amortizer to a decision,
+          and the objective gradient flows back to update the model weights.
+
+.. image:: _static/energnn-pipeline-white.png
+    :class: only-dark
+    :align: center
+    :width: 90%
+    :alt: The amortized optimization loop: a context flows through the amortizer to a decision,
+          and the objective gradient flows back to update the model weights.
+
+Here the **amortizer** is exactly the :class:`~energnn.model.GNN` (wrapped by a preprocessor / postprocessor for the
+use case), whose internal structure is detailed in `Graph Neural Network Models`_ below.
+
 -------------------------
 
 Implementing your own Use Case
@@ -137,6 +159,28 @@ In practice, a :class:`~energnn.graph.Graph` is a dictionary of :class:`~energnn
 For computations with JAX, construct the graph with a :class:`~energnn.graph.JaxBackend` instance,
 which makes it compatible with automatic differentiation and JAX transformations.
 
+**How it maps to the code.**
+The sketch below opens up a :class:`~energnn.graph.Graph` to show the objects you actually manipulate.
+A :class:`~energnn.graph.Graph` holds one :class:`~energnn.graph.HyperEdgeSet` per object class (``"lines"``,
+``"generators"``, ...). Each :class:`~energnn.graph.HyperEdgeSet` stores a ``feature_array`` (the numerical
+attributes) and a ``port_dict`` that maps each **port** name to an array of **addresses**. Addresses live in a
+single shared pool and carry no features -- they are purely the wiring between hyper-edges. The
+``non_fictitious`` masks flag padded (fictitious) objects introduced during batching, so the model can ignore them.
+
+.. image:: _static/energnn_data_structure_black.svg
+    :class: only-light
+    :align: center
+    :width: 100%
+    :alt: A Graph holds one HyperEdgeSet per object class; each hyper-edge set has a feature array and a
+          port dictionary whose port arrays index into a shared pool of addresses.
+
+.. image:: _static/energnn_data_structure_white.svg
+    :class: only-dark
+    :align: center
+    :width: 100%
+    :alt: A Graph holds one HyperEdgeSet per object class; each hyper-edge set has a feature array and a
+          port dictionary whose port arrays index into a shared pool of addresses.
+
 See the :doc:`tutorial_notebook` for an example of H2MG data.
 
 --------------------------
@@ -152,7 +196,79 @@ The main model, :class:`~energnn.model.GNN`, follows a modular pipeline:
 3. **Coupler**. Handles information propagation (e.g., via iterative message passing) over the graph structure.
 4. **Decoder**. Produces the final decision from coupled latent representations.
 
+.. image:: _static/energnn_gnn_pipeline_black.svg
+    :class: only-light
+    :align: center
+    :width: 100%
+    :alt: The GNN forward pass chains a normalizer, an encoder, a coupler and a decoder; the last three
+          form the trainable core that is vmapped over the batch.
+
+.. image:: _static/energnn_gnn_pipeline_white.svg
+    :class: only-dark
+    :align: center
+    :width: 100%
+    :alt: The GNN forward pass chains a normalizer, an encoder, a coupler and a decoder; the last three
+          form the trainable core that is vmapped over the batch.
+
+Each stage is a small, swappable module, and the table below summarizes what flows between them.
+
+.. list-table::
+    :header-rows: 1
+    :widths: 18 30 26 26
+
+    * - Stage
+      - Role
+      - Input
+      - Output
+    * - :class:`~energnn.model.normalizer.Normalizer`
+      - Rescale raw features to a training-friendly range.
+      - Context :class:`~energnn.graph.Graph`
+      - Normalized :class:`~energnn.graph.Graph`
+    * - :class:`~energnn.model.encoder.Encoder`
+      - Embed each hyper-edge's features into a latent space (class-specific MLPs).
+      - Normalized :class:`~energnn.graph.Graph`
+      - Encoded :class:`~energnn.graph.Graph`
+    * - :class:`~energnn.model.coupler.Coupler`
+      - Propagate information over the structure, producing one latent vector per address.
+      - Encoded :class:`~energnn.graph.Graph`
+      - Coordinates ``h`` of shape ``(n_addresses, latent_dim)``
+    * - :class:`~energnn.model.decoder.Decoder`
+      - Read the coordinates back into a decision (equivariant) or a global vector (invariant).
+      - Coordinates ``h`` + encoded :class:`~energnn.graph.Graph`
+      - Decision :class:`~energnn.graph.Graph` or :class:`jax.Array`
+
 All modules inherit from :class:`flax.nnx.Module`, allowing great flexibility and perfect integration with the JAX ecosystem.
+On a batch, :meth:`~energnn.model.GNN.forward_batch` runs the normalizer once and ``vmap`` s the encoder,
+coupler and decoder over the batch dimension.
+
+Inside the coupler: message passing
+....................................
+
+The **coupler** is where the graph structure is actually exploited.
+The default :class:`~energnn.model.coupler.RecurrentCoupler` behaves like a simple neural ODE solver:
+starting from zero coordinates, it repeatedly refines the per-address coordinates ``h`` with an explicit Euler step
+:math:`h \gets h + \Delta t \cdot \phi_\theta(\psi^1_\theta, \dots, \psi^n_\theta)`.
+Each **message function** :math:`\psi_\theta` gathers the coordinates sitting at the ports of every hyper-edge,
+passes them (together with the edge features) through class- and port-specific MLPs, and scatter-adds the results
+back onto the addresses.
+
+.. image:: _static/energnn_message_passing_black.svg
+    :class: only-light
+    :align: center
+    :width: 100%
+    :alt: One message-passing step gathers coordinates at each edge's ports, applies per-class MLPs,
+          scatter-adds messages back onto addresses, and takes an Euler update step.
+
+.. image:: _static/energnn_message_passing_white.svg
+    :class: only-dark
+    :align: center
+    :width: 100%
+    :alt: One message-passing step gathers coordinates at each edge's ports, applies per-class MLPs,
+          scatter-adds messages back onto addresses, and takes an Euler update step.
+
+Because this update only ever uses ``gather`` / MLP / ``scatter-add`` operations -- never the order in which
+addresses or objects happen to be stored -- the whole model is **permutation-equivariant** by construction
+(see :term:`Permutation Equivariance`).
 
 Ready-to-use GNN implementations are available in :mod:`energnn.model.ready_to_use`.
 
