@@ -270,6 +270,41 @@ Because this update only ever uses ``gather`` / MLP / ``scatter-add`` operations
 addresses or objects happen to be stored -- the whole model is **permutation-equivariant** by construction
 (see :term:`Permutation Equivariance`).
 
+Where do the trainable weights live?
+....................................
+
+A key idea of **EnerGNN** is that a GNN is *not* one monolithic network: it is a family of **small MLPs**, each
+tied to a specific object class or port, and **reused** across every object (or address) of that kind. That is
+what makes the model transfer across grids of different sizes and topologies.
+
+The figure below places every MLP of a concrete use case onto a tiny toy graph
+(the very example from :doc:`custom_use_case` -- lines, switches, generators and loads over three addresses),
+stage by stage:
+
+- the **encoder** holds one MLP per object *class* (:math:`\phi_c`), applied to each object's features;
+- each **message function** holds one MLP per *(class, port)* pair (:math:`\xi_{c,o}`), whose output is
+  scatter-added onto that port's address;
+- the **coupler update** uses a single *shared* MLP :math:`\phi`, applied at every address and repeated ``N`` times;
+- the **decoder** holds one MLP per *output* class, reading the coordinates back into a decision.
+
+.. image:: _static/energnn_mlp_map_black.svg
+    :class: only-light
+    :align: center
+    :width: 100%
+    :alt: A stage-by-stage map placing each small class- and port-specific MLP of a concrete use case
+          onto a toy graph of lines, switches, generators and loads.
+
+.. image:: _static/energnn_mlp_map_white.svg
+    :class: only-dark
+    :align: center
+    :width: 100%
+    :alt: A stage-by-stage map placing each small class- and port-specific MLP of a concrete use case
+          onto a toy graph of lines, switches, generators and loads.
+
+For this toy use case that is ``3`` encoder + ``6`` message + ``1`` shared coupler + ``2`` decoder MLPs.
+Each one is small, and the *same* weights are shared by every object or address of its kind -- so a model
+trained on one grid applies unchanged to a larger or reconfigured one.
+
 Ready-to-use GNN implementations are available in :mod:`energnn.model.ready_to_use`.
 
 .. code-block:: python

@@ -321,8 +321,219 @@ def fig_message_passing(c):
     return "".join(b)
 
 
+# ---------------------------------------------------------------------------
+# Figure 4 : Where every small MLP lives (the "weight map")
+# ---------------------------------------------------------------------------
+#
+# Concrete example (matches docs/custom_use_case.rst):
+#   context : lines(bus1,bus2; r,x)  switches(bus1,bus2; -)  generators(bus; p0,q0)  loads(bus; p,q)
+#   decision: switches(log_prob)     generators(delta_p)
+#
+# Small toy graph used as the substrate, drawn identically in every band:
+#   addresses a0, a1, a2
+#   line     L : bus1@a0, bus2@a1        (blue,   features r,x)
+#   switch   S : bus1@a1, bus2@a2        (purple, no features)
+#   generator G: bus@a0                  (green,  features p0,q0)
+#   load     D : bus@a2                  (orange, features p,q)
+
+L_COL, S_COL, G_COL, D_COL = BLUE, PURPLE, GREEN, ORANGE
+BAND_H = 306
+
+
+def _chip(x, y, w, h, accent, title, subs, c, *, faint=False, title_family=MONO):
+    """A small rounded 'MLP' card centred horizontally on x, top at y."""
+    op = 0.4 if faint else 1.0
+    fill_op = 0.05 if faint else 0.12
+    stroke = c["faint"] if faint else accent
+    tcol = c["muted"] if faint else accent
+    b = [
+        box(x - w / 2, y, w, h, stroke=stroke, fill=accent if not faint else c["ink"], rx=9, sw=1.8, opacity=fill_op),
+        box(x - w / 2, y, w, h, stroke=stroke, fill="none", rx=9, sw=1.8, opacity=op),
+        text(x, y + 19, title, fill=tcol, size=13.5, weight=700, family=title_family),
+    ]
+    for i, s in enumerate(subs):
+        b.append(text(x, y + 37 + i * 15, s, fill=c["muted"], size=11, family=MONO, style="normal"))
+    return "".join(b)
+
+
+def _addr(x, y, label, c, *, token=None, accent=None):
+    """An address node (small square) with a label underneath."""
+    s = 34
+    col = accent or c["ink"]
+    b = [
+        box(x - s / 2, y - s / 2, s, s, stroke=col, fill=col, rx=7, sw=1.8, opacity=0.10),
+        box(x - s / 2, y - s / 2, s, s, stroke=col, fill="none", rx=7, sw=1.8),
+    ]
+    if token:
+        b.append(text(x, y + 5, token, fill=c["ink"], size=14, weight=600, family=MONO))
+    b.append(text(x, y + s / 2 + 15, label, fill=c["muted"], size=12, family=MONO))
+    return "".join(b)
+
+
+def _edge(x1, y1, x2, y2, col, *, dash=None, faint=False):
+    op = 0.35 if faint else 1.0
+    d = f' stroke-dasharray="{dash}"' if dash else ""
+    return (
+        f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{col}" '
+        f'stroke-width="4" stroke-linecap="round" opacity="{op}"{d}/>'
+    )
+
+
+def _band_header(b, oy, num, accent, title, c):
+    b.append(f'<circle cx="60" cy="{oy+26}" r="15" fill="{accent}" opacity="0.16"/>')
+    b.append(f'<circle cx="60" cy="{oy+26}" r="15" fill="none" stroke="{accent}" stroke-width="1.8"/>')
+    b.append(text(60, oy + 31, str(num), fill=accent, size=16, weight=700))
+    b.append(text(86, oy + 31, title, fill=c["ink"], size=17, weight=600, anchor="start"))
+
+
+def _substrate(oy, c, *, greyed=(), tokens=None, addr_accent=None):
+    """Draw the toy graph (addresses + objects) for a band; return address coords."""
+    tokens = tokens or {}
+    a0 = (250, oy + 168)
+    a1 = (590, oy + 92)
+    a2 = (930, oy + 168)
+    gen = (250, oy + 232)
+    load = (930, oy + 232)
+    b = []
+    # object edges (drawn under the address squares)
+    b.append(_edge(*a0, *a1, L_COL, faint="line" in greyed))
+    b.append(_edge(*a1, *a2, S_COL, dash="9 6", faint="switch" in greyed))
+    # generator stub + node (a small circle hanging under a0)
+    gf = "gen" in greyed
+    b.append(_edge(a0[0], a0[1], gen[0], gen[1], G_COL, faint=gf))
+    b.append(f'<circle cx="{gen[0]}" cy="{gen[1]}" r="13" fill="{G_COL}" fill-opacity="{0.10 if not gf else 0.04}" '
+             f'stroke="{G_COL if not gf else c["faint"]}" stroke-width="1.8"/>')
+    b.append(text(gen[0], gen[1] + 5, "G", fill=(c["muted"] if gf else G_COL), size=13, weight=700))
+    # load stub + node (triangle under a2)
+    df = "load" in greyed
+    b.append(_edge(a2[0], a2[1], load[0], load[1], D_COL, faint=df))
+    tri = f'{load[0]-12},{load[1]-10} {load[0]+12},{load[1]-10} {load[0]},{load[1]+12}'
+    b.append(f'<polygon points="{tri}" fill="{D_COL}" fill-opacity="{0.10 if not df else 0.04}" '
+             f'stroke="{D_COL if not df else c["faint"]}" stroke-width="1.8"/>')
+    b.append(text(load[0], load[1] - 1, "D", fill=(c["muted"] if df else D_COL), size=12, weight=700))
+    # small object type tags near the edges
+    b.append(text((a0[0] + a1[0]) / 2 + 4, (a0[1] + a1[1]) / 2 + 26, "line L", fill=(c["muted"] if "line" in greyed else L_COL), size=11.5, family=MONO))
+    b.append(text((a1[0] + a2[0]) / 2 - 4, (a1[1] + a2[1]) / 2 + 26, "switch S", fill=(c["muted"] if "switch" in greyed else S_COL), size=11.5, family=MONO))
+    # addresses on top
+    for key, (x, y) in (("a0", a0), ("a1", a1), ("a2", a2)):
+        b.append(_addr(x, y, key, c, token=tokens.get(key), accent=addr_accent))
+    return "".join(b), {"a0": a0, "a1": a1, "a2": a2, "gen": gen, "load": load}
+
+
+def _lead(x1, y1, x2, y2, col):
+    return f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{col}" stroke-width="1.3" stroke-dasharray="3 3" opacity="0.8"/>'
+
+
+def fig_mlp_map(c):
+    W = 1180
+    H = 110 + 4 * BAND_H + 60
+    b = []
+    # ---- header ----
+    b.append(text(W / 2, 42, "Where every small MLP lives", fill=c["ink"], size=24, weight=600))
+    b.append(text(W / 2, 68,
+                  "A GNN is not one network — it is a family of tiny class- and port-specific MLPs tied to the graph.",
+                  fill=c["muted"], size=14))
+    b.append(text(W / 2, 92,
+                  "toy example:  line L (r,x) · switch S (—) · generator G (p0,q0) · load D (p,q)   over addresses a0 a1 a2"
+                  "     ·     z = encoded features,  h = per-address coordinate,  d = latent dim",
+                  fill=c["muted"], size=11.5, family=MONO))
+
+    # ================= Band 1 : Encoder =================
+    oy = 110
+    _band_header(b, oy, 1, BLUE, "Encoder — one MLP per object class, applied to each object's features", c)
+    sub, A = _substrate(oy, c, greyed=("switch",))
+    b.append(sub)
+    # encoder chips on featured objects
+    lx = (A["a0"][0] + A["a1"][0]) / 2
+    ly = (A["a0"][1] + A["a1"][1]) / 2
+    b.append(_lead(lx, oy + 74, lx, ly, BLUE))
+    b.append(_chip(lx, oy + 44, 176, 50, BLUE, "φ_lines", ["(r, x)  →  z_L ∈ ℝ^d"], c))
+    b.append(_lead(A["gen"][0] + 60, oy + 232, A["gen"][0] + 15, A["gen"][1], G_COL))
+    b.append(_chip(A["gen"][0] + 150, oy + 210, 176, 48, G_COL, "φ_generators", ["(p0, q0)  →  z_G"], c))
+    b.append(_lead(A["load"][0] - 60, oy + 232, A["load"][0] - 15, A["load"][1], D_COL))
+    b.append(_chip(A["load"][0] - 150, oy + 210, 176, 48, D_COL, "φ_loads", ["(p, q)  →  z_D"], c))
+    b.append(text((A["a1"][0] + A["a2"][0]) / 2, oy + 62, "switches have no features →", fill=c["muted"], size=11.5))
+    b.append(text((A["a1"][0] + A["a2"][0]) / 2, oy + 78, "no encoder MLP", fill=c["muted"], size=11.5, style="italic"))
+    b.append(text(W - 30, oy + 24, "the same φ_c is reused for every object of class c", fill=c["muted"], size=12, anchor="end"))
+
+    # ================= Band 2 : Message functions =================
+    oy = 110 + BAND_H
+    _band_header(b, oy, 2, PURPLE, "Coupler · messages — one MLP per (class, port), scatter-added onto the port's address", c)
+    sub, A = _substrate(oy, c, tokens={"a0": "h₀", "a1": "h₁", "a2": "h₂"})
+    b.append(sub)
+
+    def msg_chip(cx, cy, accent, name, target):
+        b.append(_chip(cx, cy, 150, 44, accent, name, [f"→ scatter-add @ {target}"], c))
+
+    # line ports
+    msg_chip(120, oy + 118, L_COL, "ξ_line,bus1", "a0")
+    b.append(_lead(120, oy + 118, A["a0"][0] - 18, A["a0"][1], L_COL))
+    msg_chip(470, oy + 40, L_COL, "ξ_line,bus2", "a1")
+    b.append(_lead(470, oy + 84, A["a1"][0] - 18, A["a1"][1] - 6, L_COL))
+    # switch ports
+    msg_chip(710, oy + 40, S_COL, "ξ_switch,bus1", "a1")
+    b.append(_lead(710, oy + 84, A["a1"][0] + 18, A["a1"][1] - 6, S_COL))
+    msg_chip(1060, oy + 118, S_COL, "ξ_switch,bus2", "a2")
+    b.append(_lead(1060, oy + 118, A["a2"][0] + 18, A["a2"][1], S_COL))
+    # gen / load ports
+    msg_chip(120, oy + 210, G_COL, "ξ_gen,bus", "a0")
+    b.append(_lead(120, oy + 210, A["gen"][0] - 14, A["gen"][1], G_COL))
+    msg_chip(1060, oy + 210, D_COL, "ξ_load,bus", "a2")
+    b.append(_lead(1060, oy + 210, A["load"][0] + 14, A["load"][1], D_COL))
+    # shared signature footnote
+    b.append(text(W / 2, oy + BAND_H - 20,
+                  "ξ_{c,o}( [ h at every port of the edge , z_c ] )  →  message added onto port o's address",
+                  fill=c["ink"], size=12.5, family=MONO))
+
+    # ================= Band 3 : shared phi update =================
+    oy = 110 + 2 * BAND_H
+    _band_header(b, oy, 3, TEAL, "Coupler · update — ONE shared MLP φ, applied at every address, repeated N times", c)
+    sub, A = _substrate(oy, c, tokens={"a0": "h₀", "a1": "h₁", "a2": "h₂"}, addr_accent=TEAL)
+    b.append(sub)
+    for key in ("a0", "a1", "a2"):
+        x, y = A[key]
+        if key == "a1":  # top node: place the chip BELOW to clear the band header
+            b.append(_lead(x, y + 20, x, y + 30, TEAL))
+            b.append(_chip(x, y + 30, 132, 44, TEAL, "φ  (shared)", ["Σ msgs → Δh"], c))
+        else:
+            b.append(_lead(x, y - 20, x, y - 34, TEAL))
+            b.append(_chip(x, y - 78, 132, 44, TEAL, "φ  (shared)", ["Σ msgs → Δh"], c))
+    b.append(text(W / 2, oy + 236,
+                  "h ← h + Δt · φ( messages )      —      one and the same φ at a0, a1, a2",
+                  fill=c["ink"], size=13, family=MONO))
+    # loop badge
+    b.append(box(W - 214, oy + 44, 184, 40, stroke=TEAL, fill=TEAL, rx=20, sw=1.6, opacity=0.10))
+    b.append(box(W - 214, oy + 44, 184, 40, stroke=TEAL, fill="none", rx=20, sw=1.6))
+    b.append(text(W - 122, oy + 69, "↻  × N steps", fill=TEAL, size=15, weight=600))
+
+    # ================= Band 4 : Decoder =================
+    oy = 110 + 3 * BAND_H
+    _band_header(b, oy, 4, ORANGE, "Decoder — one MLP per output class, reads coordinates back into a decision", c)
+    sub, A = _substrate(oy, c, greyed=("line", "load"), tokens={"a0": "h₀", "a1": "h₁", "a2": "h₂"})
+    b.append(sub)
+    # switch decoder
+    sx = (A["a1"][0] + A["a2"][0]) / 2
+    sy = (A["a1"][1] + A["a2"][1]) / 2
+    b.append(_lead(sx, oy + 74, sx, sy, S_COL))
+    b.append(_chip(sx, oy + 40, 210, 50, S_COL, "φ_switches", ["[ h₁, h₂ ]  →  log_prob"], c))
+    # gen decoder
+    b.append(_lead(A["gen"][0] + 60, oy + 232, A["gen"][0] + 15, A["gen"][1], G_COL))
+    b.append(_chip(A["gen"][0] + 160, oy + 210, 196, 50, G_COL, "φ_generators", ["[ h₀, z_G ]  →  delta_p"], c))
+    # greyed (not in decision)
+    b.append(text((A["a0"][0] + A["a1"][0]) / 2, oy + 60, "line ∉ decision", fill=c["muted"], size=11.5, style="italic"))
+    b.append(text(A["load"][0] - 150, oy + 232, "load ∉ decision", fill=c["muted"], size=11.5, style="italic"))
+
+    # ---- footer ----
+    b.append(text(W / 2, H - 24,
+                  "Total for this toy use case: 3 encoder + 6 message + 1 shared φ + 2 decoder MLPs — "
+                  "each one small, and reused across every object / address of its kind.",
+                  fill=c["muted"], size=13))
+    return "".join(b)
+
+
 if __name__ == "__main__":
     write("energnn_gnn_pipeline", 1080, 330, fig_gnn_pipeline)
     write("energnn_data_structure", 1080, 560, fig_data_structure)
     write("energnn_message_passing", 1080, 400, fig_message_passing)
+    write("energnn_mlp_map", 1180, 110 + 4 * BAND_H + 60, fig_mlp_map)
     print("done")
