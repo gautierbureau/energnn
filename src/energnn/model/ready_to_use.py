@@ -16,6 +16,23 @@ from energnn.model.utils import MLP
 
 
 class ReadyRecurrentEquivariantGNN(GNN):
+    """
+    Configurable equivariant GNN with recurrent message passing, ready to train.
+
+    It assembles a :class:`~energnn.model.normalizer.TDigestNormalizer`, an
+    :class:`~energnn.model.encoder.MLPEncoder`, a :class:`~energnn.model.coupler.RecurrentCoupler`
+    (with a single :class:`~energnn.model.coupler.LocalSumMessagePassingFunction`) and an
+    :class:`~energnn.model.decoder.MLPEquivariantDecoder` into a single :class:`~energnn.model.GNN`.
+    The ``Tiny`` / ``Small`` / ``Medium`` / ``Large`` / ``ExtraLarge`` subclasses simply preset the sizes below.
+
+    :param in_structure: Structure of the input (context) graph.
+    :param out_structure: Structure of the output (decision) graph.
+    :param n_breakpoints: Number of breakpoints of the t-digest normalizer.
+    :param latent_dimension: Dimension of the latent coordinates.
+    :param hidden_sizes: Hidden layer sizes shared by the encoder, message function and decoder MLPs.
+    :param n_steps: Number of recurrent message-passing steps.
+    :param seed: Seed for the RNG streams used at initialization.
+    """
 
     def __init__(
         self,

@@ -17,17 +17,32 @@ from .tracker import Tracker
 
 
 class MlflowTracker(Tracker):
+    """Experiment :class:`~energnn.tracker.Tracker` backed by `MLflow <https://mlflow.org/>`_.
+
+    Logs run configurations and metrics to an MLflow tracking server, and can reference datasets
+    as MLflow artifacts. Pass an instance to :meth:`~energnn.trainer.Trainer.train` to monitor training.
+
+    :param project_name: Name of the MLflow experiment to log runs under.
+    :param tracking_uri: URI of the MLflow tracking server (or a local path).
+    """
 
     def __init__(self, project_name: str, tracking_uri: str) -> None:
         mlflow.set_tracking_uri(tracking_uri)
         mlflow.set_experiment(project_name)
 
     def init_run(self, *, name: str, tags: dict[str, str], cfg: DictConfig):
+        """Start an MLflow run, tag it, and log its (flattened) configuration as parameters.
+
+        :param name: Name for the run.
+        :param tags: Tags used to categorize the run.
+        :param cfg: Configuration object logged as run parameters.
+        """
         mlflow.start_run(run_name=name, tags=tags)
         cfg_dict = stringify_unsupported(OmegaConf.to_container(cfg, resolve=True))
         mlflow.log_params(cfg_dict)
 
     def stop_run(self):
+        """End the currently active MLflow run, flushing any pending logs."""
         mlflow.end_run()
 
     def run_track_dataset(self, *, infos: dict, target_path: str) -> None:
@@ -43,6 +58,14 @@ class MlflowTracker(Tracker):
             mlflow.log_artifact(f"{tmp_dir}/infos.json", artifact_path=f"datasets/{target_path}")
 
     def run_append(self, *, infos: dict, step: int) -> None:
+        """Log the (flattened) ``infos`` dictionary as MLflow metrics at the given step.
+
+        Nested keys are flattened with ``/``; empty or all-NaN values are skipped, and array-valued
+        entries are reduced with ``nanmean``.
+
+        :param infos: Information dictionary to log as metrics.
+        :param step: Training or evaluation step associated with these metrics.
+        """
         flat_infos = flatdict.FlatDict(infos, delimiter="/")
         for k, val in flat_infos.items():
             if (isinstance(val, dict)) or (np.size(val) == 0) or (np.all(np.isnan(val))):

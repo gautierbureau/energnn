@@ -4,6 +4,21 @@
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 # SPDX-License-Identifier: MPL-2.0
 
+"""Worked example: learning to solve DC power flow linear systems.
+
+This module implements the :mod:`energnn.problem` interface for a simple supervised task used throughout
+the documentation and the :doc:`tutorial </tutorial_notebook>`. Each problem instance is a sparse linear
+system :math:`B \\theta = P` describing a DC power grid, where:
+
+- :math:`B` is the (susceptance) matrix of the grid,
+- :math:`P` is the vector of active power injections at the buses,
+- :math:`\\theta` is the vector of bus phase angles -- the quantity to predict.
+
+The **context** graph carries the ``line`` susceptances and the ``bus`` injections; the **decision** graph
+carries a ``phase_angle`` per bus. The objective is the mean-squared error to the oracle solution
+:math:`\\theta = B^{-1} P`, so the gradient reduces to ``decision - oracle``.
+"""
+
 import copy
 from copy import deepcopy
 
@@ -29,6 +44,16 @@ LINEAR_SYSTEM_DECISION_STRUCTURE = GraphStructure(
 
 
 class LinearSystemProblemBatch(ProblemBatch):
+    """Batched :class:`~energnn.problem.ProblemBatch` for the DC power flow example.
+
+    Holds a batch of contexts (line susceptances and bus injections) together with their oracle solutions
+    (bus phase angles). Because the objective is the mean-squared error to the oracle, the gradient is
+    simply ``decision - oracle``.
+
+    :param context: Batched context graph.
+    :param oracle: Batched oracle graph holding the ground-truth phase angles.
+    """
+
     __test__ = False
 
     def __init__(self, *, context: Graph, oracle: Graph):
@@ -85,6 +110,16 @@ class LinearSystemProblemBatch(ProblemBatch):
 
 
 class LinearSystemProblem(Problem):
+    """Single :class:`~energnn.problem.Problem` instance of the DC power flow example.
+
+    Represents one linear system :math:`B \\theta = P`: the context carries the line susceptances and bus
+    injections, the oracle carries the ground-truth phase angles. The score is the mean-squared error to
+    the oracle and the gradient is ``decision - oracle``.
+
+    :param context: Context graph of this instance.
+    :param oracle: Oracle graph holding the ground-truth phase angles.
+    """
+
     __test__ = False
 
     def __init__(self, *, context: Graph, oracle: Graph):
@@ -180,8 +215,17 @@ def _generate_sparse_linear_system(n, m):
 
 
 class LinearSystemProblemGenerator:
+    """Draws random sparse DC power flow systems :math:`B \\theta = P`.
+
+    Each instance builds a connected susceptance matrix ``B`` (a random spanning tree plus extra edges),
+    a random phase-angle vector ``theta`` (the oracle) and the induced injections ``P = B @ theta``. The
+    number of buses is drawn per instance, up to ``n_max``.
+
+    :param seed: Seed for the NumPy RNG.
+    :param n_max: Maximum number of buses of a generated instance.
+    """
+
     __test__ = False
-    """Generates random sparse linear systems."""
 
     def __init__(self, *, seed: int = 0, n_max: int = 32):
 
@@ -191,6 +235,7 @@ class LinearSystemProblemGenerator:
         np.random.seed(seed)
 
     def generate_problem(self) -> LinearSystemProblem:
+        """Draw a single :class:`LinearSystemProblem` with a random number of buses."""
         n = np.random.randint(2, self.n_max + 1)
         m = np.random.randint(n - 1, n * (n - 1) // 2 + 1)
         B, P, theta = _generate_sparse_linear_system(n, m)
@@ -217,7 +262,12 @@ class LinearSystemProblemGenerator:
         return LinearSystemProblem(context=context, oracle=oracle)
 
     def generate_problem_batch(self, batch_size: int = 8) -> LinearSystemProblemBatch:
+        """Draw ``batch_size`` instances and collate them into a :class:`LinearSystemProblemBatch`.
 
+        Each instance is padded to ``n_max`` before collation, so the batch has a homogeneous shape.
+
+        :param batch_size: Number of instances in the batch.
+        """
         context_list, oracle_list = [], []
 
         for _ in range(batch_size):
@@ -249,6 +299,19 @@ class LinearSystemProblemGenerator:
 
 
 class LinearSystemProblemLoader(ProblemLoader):
+    """:class:`~energnn.problem.ProblemLoader` yielding batches of the DC power flow example.
+
+    Freshly generates each :class:`LinearSystemProblemBatch` on iteration, so it can be passed directly as
+    the ``train_loader`` (or ``val_loader``) of a :class:`~energnn.trainer.Trainer`. Reset the RNG by
+    re-iterating; use a different ``seed`` for a disjoint dataset (e.g. train vs. validation).
+
+    :param seed: Seed for the NumPy RNG.
+    :param dataset_size: Number of problem instances per epoch.
+    :param batch_size: Number of instances per batch.
+    :param n_max: Maximum number of buses of a generated instance.
+    :param shuffle: Kept for interface compatibility (instances are generated on the fly).
+    """
+
     __test__ = False
 
     def __init__(

@@ -78,3 +78,30 @@ Loader
    ProblemLoader.__len__
    ProblemLoader.context_structure
    ProblemLoader.decision_structure
+
+
+Worked example: DC power flow
+=============================
+
+A complete, runnable implementation of the interface above is provided in
+:mod:`energnn.problem.example`. It frames the resolution of DC power flow linear systems
+:math:`B \theta = P` as a supervised learning task, and is used in the :doc:`/tutorial_notebook`
+and the :doc:`Quick Start </index>`.
+
+.. currentmodule:: energnn.problem.example
+
+.. autoclass:: LinearSystemProblem
+   :no-members:
+   :show-inheritance:
+
+.. autoclass:: LinearSystemProblemBatch
+   :no-members:
+   :show-inheritance:
+
+.. autoclass:: LinearSystemProblemLoader
+   :no-members:
+   :show-inheritance:
+
+.. autoclass:: LinearSystemProblemGenerator
+   :no-members:
+   :show-inheritance:
