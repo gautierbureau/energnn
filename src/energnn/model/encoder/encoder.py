@@ -14,6 +14,11 @@ from energnn.graph import Graph
 
 
 class Encoder(nnx.Module, ABC):
+    """Interface for an encoder.
+
+    An encoder embeds the features of an input graph into a latent space, returning a graph
+    with the same hyper-edge set classes and connectivity but with encoded features.
+    """
 
     @abstractmethod
     def __call__(self, graph: Graph, get_info: bool = False) -> tuple[Graph, dict]:

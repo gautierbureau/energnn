@@ -15,28 +15,38 @@ graphs. The backend (NumPy or JAX) is controlled by passing a :class:`NumpyBacke
 :class:`JaxBackend` instance at construction time.
 
 .. note::
-    Here is a typical instance of :class:`Graph`.
+    Here is a small :class:`Graph` with two lines and one generator over three addresses.
 
     .. code:: python
 
+        >>> from energnn.graph import Graph, HyperEdgeSet
+        >>> import numpy as np
+        >>> lines = HyperEdgeSet.from_dict(
+        ...     port_dict={"bus1": np.array([0, 1]), "bus2": np.array([1, 2])},
+        ...     feature_dict={"r": np.array([0.01, 0.02]), "x": np.array([0.10, 0.12])},
+        ... )
+        >>> generators = HyperEdgeSet.from_dict(
+        ...     port_dict={"bus": np.array([0])},
+        ...     feature_dict={"p0": np.array([1.5]), "q0": np.array([0.3])},
+        ... )
+        >>> graph = Graph.from_dict(
+        ...     hyper_edge_set_dict={"lines": lines, "generators": generators}, n_addresses=3
+        ... )
         >>> print(graph)
-        Mass
+        generators
+                  ports features
+                    bus       p0   q0
+        object_id
+        0           0.0      1.5  0.3
+        lines
                   ports      features
-                    node_id    weight         x         y         z
+                   bus1 bus2        r     x
         object_id
-        0               0.0  5.322265  0.202435  0.202435  0.242032
-        1               1.0  3.496568  0.962326  0.962326  0.306690
-        2               2.0  3.535864  0.060886  0.060886  0.094170
-        3               3.0  7.213709  0.984766  0.984766  0.068853
-        Spring
-                  ports              features
-                   node1_id node2_id         k
-        object_id
-        0               0.0      1.0  0.020424
-        1               1.0      2.0  0.037591
-        2               2.0      3.0  0.045405
-        Registry
-        [0. 1. 2. 3.]
+        0           0.0  1.0     0.01  0.10
+        1           1.0  2.0     0.02  0.12
+
+    Each hyper-edge set prints as a table whose columns are grouped into **ports** (addresses the
+    object connects to) and **features** (its numerical attributes).
 
 
 Graph
