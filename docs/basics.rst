@@ -304,6 +304,8 @@ stage by stage:
 For this toy use case that is ``3`` encoder + ``6`` message + ``1`` shared coupler + ``2`` decoder MLPs.
 Each one is small, and the *same* weights are shared by every object or address of its kind -- so a model
 trained on one grid applies unchanged to a larger or reconfigured one.
+For a complete list of every MLP, where it lives in the code and what it means, see the
+:doc:`reference/model/mlp_catalog`.
 
 Ready-to-use GNN implementations are available in :mod:`energnn.model.ready_to_use`.
 

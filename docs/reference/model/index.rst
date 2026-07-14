@@ -36,3 +36,4 @@ Components
     core_gnn/index
     modules/index
     ready_to_use/index
+    mlp_catalog
