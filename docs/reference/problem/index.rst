@@ -78,3 +78,39 @@ Loader
    ProblemLoader.__len__
    ProblemLoader.context_structure
    ProblemLoader.decision_structure
+
+
+Supervised problems
+===================
+
+.. autoclass:: SupervisedProblemBatch
+   :no-members:
+   :show-inheritance:
+
+.. autoclass:: SupervisedProblem
+   :no-members:
+   :show-inheritance:
+
+
+Losses
+======
+
+.. automodule:: energnn.problem.loss
+   :no-members:
+
+.. currentmodule:: energnn.problem.loss
+
+.. autosummary::
+   :toctree: _autosummary
+   :nosignatures:
+
+   Loss
+   MeanSquaredError
+   MeanAbsoluteError
+   Huber
+   BinaryCrossEntropy
+   SoftmaxCrossEntropy
+   SigmoidFocalLoss
+   Accuracy
+   LossTerm
+   SupervisedLoss

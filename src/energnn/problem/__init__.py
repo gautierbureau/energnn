@@ -8,5 +8,15 @@ from . import example
 from .batch import ProblemBatch
 from .loader import ProblemLoader
 from .problem import Problem
+from . import loss
+from .supervised import SupervisedProblem, SupervisedProblemBatch
 
-__all__ = ["Problem", "ProblemBatch", "ProblemLoader", "example"]
+__all__ = [
+    "Problem",
+    "ProblemBatch",
+    "ProblemLoader",
+    "SupervisedProblem",
+    "SupervisedProblemBatch",
+    "example",
+    "loss",
+]
