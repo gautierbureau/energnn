@@ -149,6 +149,38 @@ improvement for a decision.
             # Implement your own load method
             pass
 
+Supervised problems: no gradient to write
+-----------------------------------------
+
+When the task is supervised (regression, node or edge classification, ...), the objective is a classical loss
+:math:`\mathcal{L}(\hat{y}, y)` between the decision and a known **target** graph :math:`y`.
+Use :class:`~energnn.problem.SupervisedProblemBatch` (or :class:`~energnn.problem.SupervisedProblem`) with a
+ready-made loss from :mod:`energnn.problem.loss`: the gradient is obtained by JAX automatic differentiation.
+
+.. code-block:: python
+
+    from energnn.problem import SupervisedProblemBatch
+    from energnn.problem.loss import Accuracy, MeanSquaredError, SoftmaxCrossEntropy
+
+    batch = SupervisedProblemBatch(
+        context=context_batch,
+        target=target_batch,                       # padded like the decision
+        loss={"bus": SoftmaxCrossEntropy(),         # decoder outputs C logits per bus,
+              "line": (MeanSquaredError(), 0.1)},   # target holds the class index; weighted terms
+        metric={"bus": Accuracy()},                # validation score (use optim_mode="maximize")
+    )
+
+Available losses: :class:`~energnn.problem.loss.MeanSquaredError`, :class:`~energnn.problem.loss.MeanAbsoluteError`,
+:class:`~energnn.problem.loss.Huber`, :class:`~energnn.problem.loss.BinaryCrossEntropy`,
+:class:`~energnn.problem.loss.SoftmaxCrossEntropy`, :class:`~energnn.problem.loss.SigmoidFocalLoss`, and the
+:class:`~energnn.problem.loss.Accuracy` metric. A custom one is a frozen dataclass subclassing
+:class:`~energnn.problem.loss.Loss` whose ``__call__`` maps ``(prediction, target)`` feature arrays to one value per object.
+Each term is averaged over the real (non-fictitious) objects of its hyper-edge set, so padding never contributes.
+
+**Compiled once.** The :class:`~energnn.trainer.Trainer` runs forward, loss, backward and optimizer update of a supervised
+batch as a single jitted function. Losses are hashable by value and passed as static arguments, so a training run
+compiles once per batch shape (twice if ``log_period`` toggles ``get_info``): pad every batch to the same shape.
+
 Step 2 — Handle Batching (Problem Batch)
 ----------------------------------------
 

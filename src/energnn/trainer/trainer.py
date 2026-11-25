@@ -22,7 +22,8 @@ from tqdm import tqdm
 
 from energnn.graph import Graph
 from energnn.model import GNN
-from energnn.problem import ProblemBatch, ProblemLoader
+from energnn.problem import ProblemBatch, ProblemLoader, SupervisedProblemBatch
+from energnn.problem.loss import SupervisedLoss
 from energnn.tracker import Tracker
 from .utils import TaskLogger
 
@@ -88,6 +89,11 @@ class Trainer:
     :type model: GNN
     :param gradient_transformation: Optax gradient transformation.
     :type gradient_transformation: optax.GradientTransformation
+    :param fuse_supervised_step: If true (default), batches of :class:`~energnn.problem.SupervisedProblemBatch`
+        are trained with one compiled function doing forward, loss, backward and optimizer update
+        (:math:`\nabla_\theta \mathcal{L}(\hat{y}_\theta(x), y)` by automatic differentiation), instead of the
+        generic forward / ``get_gradient`` / VJP sequence. Both give the same update.
+    :type fuse_supervised_step: bool
     """
 
     def __init__(
@@ -95,6 +101,7 @@ class Trainer:
         *,
         model: GNN,
         gradient_transformation: GradientTransformation,
+        fuse_supervised_step: bool = True,
     ):
         self.model: GNN = model
         self.optimizer = nnx.Optimizer(self.model, gradient_transformation, wrt=nnx.Param)
@@ -106,6 +113,22 @@ class Trainer:
         self._jit_apply = nnx.jit(self._apply_forward_vjp, static_argnames=("get_info",))
         self._jit_eval_forward = nnx.jit(self._eval_forward)
         self._jit_update_params = nnx.jit(_update_params_fn)
+        # Supervised problems: the whole training step is one compiled program. The loss is hashable by
+        # value, so it is a static argument: one compilation per (loss, get_info, batch shapes).
+        self.fuse_supervised_step = fuse_supervised_step
+        self._jit_supervised_step = nnx.jit(self._supervised_step, static_argnames=("loss", "get_info"))
+
+    @staticmethod
+    def _supervised_step(model, optimizer, context, target, loss: SupervisedLoss, get_info: bool):
+        """Forward + loss + backward + optimizer update, designed to be JIT-compiled once and reused."""
+
+        def objective(m):
+            decision, info = m.forward_batch(graph=context, get_info=get_info)
+            return loss(decision, target), info
+
+        (value, info), grads = nnx.value_and_grad(objective, has_aux=True)(model)
+        optimizer.update(model, grads)
+        return value, info
 
     @staticmethod
     def _apply_forward_vjp(graphdef, params, rest, jax_context, get_info):
@@ -339,6 +362,9 @@ class Trainer:
         :param get_info: Whether to compute information or not.
         :return: A dictionary of information about the training step, or list of dictionaries.
         """
+        if self.fuse_supervised_step and isinstance(problem_batch, SupervisedProblemBatch):
+            return self._fused_supervised_training_step(problem_batch, get_info)
+
         with TaskLogger(logger, f"Training step {self.train_step}"):
 
             t_start = time.perf_counter()
@@ -398,6 +424,25 @@ class Trainer:
         infos = flatdict.FlatDict(infos, delimiter="/")
         infos = {k: np.array(v) for k, v in infos.items()}
 
+        return infos
+
+    def _fused_supervised_training_step(self, problem_batch: SupervisedProblemBatch, get_info: bool) -> dict:
+        """Training step of a supervised batch: one compiled call, no hand-written gradient."""
+        with TaskLogger(logger, f"Training step {self.train_step} (fused supervised)"):
+            self.model.train()  # Set model to train mode
+            infos = {}
+            jax_context, infos["1_context"] = problem_batch.get_context(get_info=get_info, step=self.train_step)
+            jax_target, _ = problem_batch.get_target(get_info=get_info, step=self.train_step)
+            value, forward_info = self._jit_supervised_step(
+                self.model, self.optimizer, jax_context, jax_target, loss=problem_batch.loss, get_info=get_info
+            )
+            if get_info:
+                infos["2_forward"] = forward_info
+                infos["3_loss"] = {"loss": value}
+            infos["4_update"] = {}
+
+        infos = flatdict.FlatDict(infos, delimiter="/")
+        infos = {k: np.array(v) for k, v in infos.items()}
         return infos
 
     def eval_step(self, eval_step: int, problem_batch: ProblemBatch) -> tuple[list[float], dict]:
